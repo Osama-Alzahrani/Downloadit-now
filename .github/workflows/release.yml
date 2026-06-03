@@ -44,13 +44,23 @@ jobs:
           $version = $tag.TrimStart('v')
           echo "VERSION=$version" >> $env:GITHUB_OUTPUT
 
+      - name: List bundle output
+        run: Get-ChildItem src-tauri/target/release/bundle -Recurse | Select-Object FullName
+
       - name: Generate latest.json
         run: |
           $version = "${{ steps.version.outputs.VERSION }}"
           $bundleDir = "src-tauri/target/release/bundle/msi"
-          $msi  = (Get-ChildItem "$bundleDir/*.msi"     | Select-Object -First 1).Name
-          $sig  = Get-Content (Get-ChildItem "$bundleDir/*.msi.sig" | Select-Object -First 1).FullName -Raw
-          $url  = "https://github.com/${{ github.repository }}/releases/download/${{ github.ref_name }}/$msi"
+
+          $msiItem = Get-ChildItem "$bundleDir/*.msi" -Exclude "*.msi.sig" | Select-Object -First 1
+          $sigItem = Get-ChildItem "$bundleDir/*.msi.sig" | Select-Object -First 1
+
+          if (-not $msiItem) { Write-Error "MSI not found in $bundleDir"; exit 1 }
+          if (-not $sigItem) { Write-Error "Signature (.msi.sig) not found — is TAURI_SIGNING_PRIVATE_KEY set in repo secrets?"; exit 1 }
+
+          $sig = Get-Content $sigItem.FullName -Raw
+          $url = "https://github.com/${{ github.repository }}/releases/download/${{ github.ref_name }}/$($msiItem.Name)"
+
           $json = [ordered]@{
             version  = $version
             notes    = "See the release page for what's new."
@@ -62,6 +72,7 @@ jobs:
               }
             }
           } | ConvertTo-Json -Depth 10
+
           $json | Out-File -FilePath "latest.json" -Encoding utf8NoBOM
           Write-Host "Generated latest.json:"
           Get-Content latest.json
