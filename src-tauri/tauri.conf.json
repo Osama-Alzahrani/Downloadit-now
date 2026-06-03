@@ -1,6 +1,6 @@
 {
   "productName": "Downloadit",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "identifier": "com.downloadit.desktop",
   "build": {
     "beforeDevCommand": "npm run dev",
@@ -39,9 +39,9 @@
   },
   "plugins": {
     "updater": {
-      "pubkey": "REPLACE_WITH_YOUR_PUBLIC_KEY",
+      "pubkey": "dW50cnVzdGVkIGNvbW1lbnQ6IG1pbmlzaWduIHB1YmxpYyBrZXk6IDU5QTE0RTc1MjhFQ0E3OTcKUldTWHArd29kVTZoV2R6MFJQZ3c4ZEhJQzMzcnV3LzBHeUxQWkZoZllpTEU5L055VEZpK2tFSzIK",
       "endpoints": [
-        "https://github.com/REPLACE_WITH_YOUR_USERNAME/REPLACE_WITH_YOUR_REPO/releases/latest/download/latest.json"
+        "https://github.com/Osama-Alzahrani/Downloadit-now/releases/latest/download/latest.json"
       ],
       "dialog": false
     }
