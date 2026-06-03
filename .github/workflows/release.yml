@@ -32,7 +32,7 @@ jobs:
       - name: Cache WiX toolset
         uses: actions/cache@v4
         with:
-          path: ~/.cache/tauri
+          path: ${{ env.LOCALAPPDATA }}\tauri
           key: wix-${{ runner.os }}
 
       - name: Install frontend dependencies
