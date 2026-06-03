@@ -6,8 +6,9 @@ use std::io::Write;
 use tokio::sync::Mutex;
 use tokio::io::AsyncBufReadExt;
 use tokio::io::BufReader;
-use tokio::process::{Command, Child};
+use tokio::process::Command;
 use tauri::Emitter;
+use futures_util::StreamExt;
 
 /// Helper macro to print and flush immediately
 macro_rules! println_flush {
@@ -17,136 +18,241 @@ macro_rules! println_flush {
     }};
 }
 
-// Global state to track active download
-lazy_static::lazy_static! {
-    pub static ref DOWNLOAD_STATE: Mutex<Option<Child>> = Mutex::new(None);
-    pub static ref DOWNLOAD_PID: Mutex<Option<u32>> = Mutex::new(None);
-    pub static ref DOWNLOAD_DIR: Mutex<Option<PathBuf>> = Mutex::new(None);
-    // Snapshot of files before download started, so cancel can find the exact new .part file
-    pub static ref DOWNLOAD_PRE_SNAPSHOT: Mutex<std::collections::HashSet<PathBuf>> = Mutex::new(std::collections::HashSet::new());
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct VideoInfo {
+    pub title: String,
+    pub thumbnail: Option<String>,
+    pub duration: Option<f64>,
+    pub filesize: Option<i64>,
+    pub ext: Option<String>,
+    pub width: Option<u64>,
+    pub height: Option<u64>,
 }
 
-/// Pause the active download (kill process but keep file)
-pub async fn pause_download() -> Result<String, String> {
-    println_flush!("⏸ pause_download called");
+// Per-download state entry
+struct DownloadEntry {
+    pid: u32,
+    dir: PathBuf,
+    snapshot: std::collections::HashSet<PathBuf>,
+}
 
-    let pid = {
-        let pid_guard = DOWNLOAD_PID.lock().await;
-        pid_guard.as_ref().copied()
-    };
+// Global registry: download_id -> DownloadEntry
+lazy_static::lazy_static! {
+    static ref DOWNLOADS: Mutex<std::collections::HashMap<String, DownloadEntry>> =
+        Mutex::new(std::collections::HashMap::new());
+}
 
-    if let Some(pid) = pid {
-        println_flush!("⏸ Found PID: {}, pausing...", pid);
+fn kill_pid(pid: u32) {
+    #[cfg(target_os = "windows")]
+    { let _ = std::process::Command::new("taskkill").args(&["/PID", &pid.to_string(), "/F", "/T"]).output(); }
+    #[cfg(not(target_os = "windows"))]
+    { let _ = std::process::Command::new("kill").args(&["-9", &pid.to_string()]).output(); }
+}
 
-        #[cfg(target_os = "windows")]
-        {
-            let _ = std::process::Command::new("taskkill")
-                .args(&["/PID", &pid.to_string(), "/F", "/T"])
-                .output();
+/// Returns the directory where yt-dlp and ffmpeg are stored
+pub fn get_tools_dir() -> PathBuf {
+    dirs::data_local_dir()
+        .unwrap_or_else(|| PathBuf::from("."))
+        .join("Downloadit")
+        .join("bin")
+}
+
+#[derive(serde::Serialize, serde::Deserialize, Clone)]
+pub struct DepsStatus {
+    pub ytdlp: bool,
+    pub ffmpeg: bool,
+}
+
+pub fn check_deps_status() -> DepsStatus {
+    let dir = get_tools_dir();
+    DepsStatus {
+        ytdlp: dir.join("yt-dlp.exe").exists(),
+        ffmpeg: dir.join("ffmpeg.exe").exists(),
+    }
+}
+
+async fn download_file_with_progress(
+    client: &reqwest::Client,
+    window: &tauri::Window,
+    tool: &str,
+    url: &str,
+    dest: &PathBuf,
+) -> Result<(), String> {
+    let resp = client
+        .get(url)
+        .header("User-Agent", "Downloadit/1.0")
+        .send()
+        .await
+        .map_err(|e| format!("Request failed: {}", e))?;
+
+    if !resp.status().is_success() {
+        return Err(format!("HTTP {}", resp.status()));
+    }
+
+    let total = resp.content_length().unwrap_or(0);
+    let mut downloaded: u64 = 0;
+    let mut stream = resp.bytes_stream();
+
+    let mut file = tokio::fs::File::create(dest)
+        .await
+        .map_err(|e| format!("Cannot create file: {}", e))?;
+
+    while let Some(chunk) = stream.next().await {
+        let chunk = chunk.map_err(|e| format!("Download error: {}", e))?;
+        tokio::io::AsyncWriteExt::write_all(&mut file, &chunk)
+            .await
+            .map_err(|e| format!("Write error: {}", e))?;
+        downloaded += chunk.len() as u64;
+        if total > 0 {
+            let progress = (downloaded as f64 / total as f64 * 100.0).min(100.0);
+            let _ = window.emit("setup-progress", serde_json::json!({
+                "tool": tool,
+                "progress": progress,
+                "status": format!("Downloading {}… {:.0}%", tool, progress)
+            }));
         }
+    }
 
-        #[cfg(not(target_os = "windows"))]
-        {
-            let _ = std::process::Command::new("kill")
-                .args(&["-9", &pid.to_string()])
-                .output();
+    Ok(())
+}
+
+async fn get_ffmpeg_download_url(client: &reqwest::Client) -> Result<String, String> {
+    let json: serde_json::Value = client
+        .get("https://api.github.com/repos/BtbN/FFmpeg-Builds/releases/latest")
+        .header("User-Agent", "Downloadit/1.0")
+        .send()
+        .await
+        .map_err(|e| e.to_string())?
+        .json()
+        .await
+        .map_err(|e| e.to_string())?;
+
+    let assets = json["assets"].as_array()
+        .ok_or("No assets in release")?;
+
+    for asset in assets {
+        let name = asset["name"].as_str().unwrap_or("");
+        // Pick the non-shared win64 GPL zip
+        if name.contains("win64-gpl") && name.ends_with(".zip") && !name.contains("shared") {
+            return asset["browser_download_url"]
+                .as_str()
+                .map(|s| s.to_string())
+                .ok_or("No download URL".to_string());
         }
+    }
 
-        // Kill the child process
-        let mut state = DOWNLOAD_STATE.lock().await;
-        if let Some(mut child) = state.take() {
-            let _ = child.kill().await;
+    Err("ffmpeg release asset not found".to_string())
+}
+
+async fn extract_ffmpeg_exe(zip_path: &PathBuf, dest_dir: &PathBuf) -> Result<(), String> {
+    let zip_path = zip_path.clone();
+    let dest_dir = dest_dir.clone();
+    tokio::task::spawn_blocking(move || {
+        use std::io::Read;
+        let file = std::fs::File::open(&zip_path).map_err(|e| e.to_string())?;
+        let mut archive = zip::ZipArchive::new(file).map_err(|e| e.to_string())?;
+
+        for i in 0..archive.len() {
+            let mut entry = archive.by_index(i).map_err(|e| e.to_string())?;
+            let name = entry.name().replace('\\', "/").to_lowercase();
+            if name.ends_with("bin/ffmpeg.exe") {
+                let mut data = Vec::new();
+                entry.read_to_end(&mut data).map_err(|e| e.to_string())?;
+                std::fs::write(dest_dir.join("ffmpeg.exe"), &data)
+                    .map_err(|e| e.to_string())?;
+                let _ = std::fs::remove_file(&zip_path);
+                return Ok(());
+            }
         }
+        let _ = std::fs::remove_file(&zip_path);
+        Err("ffmpeg.exe not found in archive".to_string())
+    })
+    .await
+    .map_err(|e| e.to_string())?
+}
 
-        let mut pid_guard = DOWNLOAD_PID.lock().await;
-        *pid_guard = None;
+pub async fn check_dependencies() -> DepsStatus {
+    check_deps_status()
+}
 
+pub async fn download_dependencies(window: tauri::Window) -> Result<(), String> {
+    let dir = get_tools_dir();
+    std::fs::create_dir_all(&dir).map_err(|e| format!("Cannot create tools dir: {}", e))?;
+
+    let client = reqwest::Client::builder()
+        .redirect(reqwest::redirect::Policy::limited(10))
+        .build()
+        .map_err(|e| e.to_string())?;
+
+    // --- yt-dlp ---
+    let ytdlp_path = dir.join("yt-dlp.exe");
+    if !ytdlp_path.exists() {
+        let _ = window.emit("setup-progress", serde_json::json!({
+            "tool": "yt-dlp", "progress": 0, "status": "Starting yt-dlp download…"
+        }));
+        download_file_with_progress(
+            &client, &window, "yt-dlp",
+            "https://github.com/yt-dlp/yt-dlp/releases/latest/download/yt-dlp.exe",
+            &ytdlp_path,
+        ).await?;
+    }
+
+    // --- ffmpeg ---
+    let ffmpeg_path = dir.join("ffmpeg.exe");
+    if !ffmpeg_path.exists() {
+        let _ = window.emit("setup-progress", serde_json::json!({
+            "tool": "ffmpeg", "progress": 0, "status": "Looking up latest ffmpeg release…"
+        }));
+
+        let ffmpeg_url = get_ffmpeg_download_url(&client).await?;
+        println_flush!("📦 ffmpeg URL: {}", ffmpeg_url);
+
+        let zip_path = std::env::temp_dir().join("downloadit_ffmpeg.zip");
+        download_file_with_progress(&client, &window, "ffmpeg", &ffmpeg_url, &zip_path).await?;
+
+        let _ = window.emit("setup-progress", serde_json::json!({
+            "tool": "ffmpeg", "progress": 99, "status": "Extracting ffmpeg…"
+        }));
+        extract_ffmpeg_exe(&zip_path, &dir).await?;
+    }
+
+    let _ = window.emit("setup-progress", serde_json::json!({
+        "tool": "done", "progress": 100, "status": "Setup complete!"
+    }));
+    Ok(())
+}
+
+/// Pause a specific download by ID (kill process, keep .part file)
+pub async fn pause_download(download_id: String) -> Result<String, String> {
+    println_flush!("⏸ pause_download [{}]", download_id);
+    let entry = DOWNLOADS.lock().await.remove(&download_id);
+    if let Some(e) = entry {
+        kill_pid(e.pid);
         Ok("Download paused".to_string())
     } else {
-        println_flush!("❌ No active download to pause");
-        Err("No active download to pause".to_string())
+        Err("No active download with that ID".to_string())
     }
 }
 
-/// Cancel the active download and delete the downloaded file
-pub async fn cancel_download() -> Result<String, String> {
-    println_flush!("🔴 cancel_download called");
-
-    // Try to kill the process
-    let pid = {
-        let pid_guard = DOWNLOAD_PID.lock().await;
-        println_flush!("🔍 Checking DOWNLOAD_PID...");
-        let p = pid_guard.as_ref().copied();
-        println_flush!("🔍 PID result: {:?}", p);
-        p
-    };
-
-    if let Some(pid) = pid {
-        println_flush!("🔴 Found PID: {}, attempting to kill...", pid);
-
-        #[cfg(target_os = "windows")]
-        {
-            let _ = std::process::Command::new("taskkill")
-                .args(&["/PID", &pid.to_string(), "/F", "/T"])
-                .output();
-        }
-
-        #[cfg(not(target_os = "windows"))]
-        {
-            let _ = std::process::Command::new("kill")
-                .args(&["-9", &pid.to_string()])
-                .output();
-        }
-
-        // Kill the child process
-        let mut state = DOWNLOAD_STATE.lock().await;
-        if let Some(mut child) = state.take() {
-            let _ = child.kill().await;
-        }
-
-        let mut pid_guard = DOWNLOAD_PID.lock().await;
-        *pid_guard = None;
-    }
-
-    // Find and delete the new .part file created by this download
-    // by comparing current directory contents against pre-download snapshot
-    let dir_path = {
-        let mut dir_guard = DOWNLOAD_DIR.lock().await;
-        dir_guard.take()
-    };
-    let snapshot = {
-        let mut snap_guard = DOWNLOAD_PRE_SNAPSHOT.lock().await;
-        std::mem::take(&mut *snap_guard)
-    };
-
-    if let Some(dir) = dir_path {
-        println_flush!("🔍 Scanning for new .part files in: {}", dir.display());
-        match std::fs::read_dir(&dir) {
-            Ok(entries) => {
-                let mut deleted = false;
-                for entry in entries.flatten() {
-                    let path = entry.path();
-                    if path.to_string_lossy().ends_with(".part") && !snapshot.contains(&path) {
-                        println_flush!("🗑️ Deleting new .part file: {}", path.display());
-                        match std::fs::remove_file(&path) {
-                            Ok(_) => { println_flush!("✅ Deleted"); deleted = true; }
-                            Err(e) => { println_flush!("⚠️ Failed: {}", e); }
-                        }
-                    }
-                }
-                if deleted {
-                    Ok("Download cancelled and file deleted".to_string())
-                } else {
-                    Ok("Download cancelled (no incomplete file found)".to_string())
+/// Cancel a specific download by ID (kill process + delete .part file)
+pub async fn cancel_download(download_id: String) -> Result<String, String> {
+    println_flush!("🔴 cancel_download [{}]", download_id);
+    let entry = DOWNLOADS.lock().await.remove(&download_id);
+    if let Some(e) = entry {
+        kill_pid(e.pid);
+        // Delete the .part file created by this download
+        if let Ok(entries) = std::fs::read_dir(&e.dir) {
+            for ent in entries.flatten() {
+                let path = ent.path();
+                if path.to_string_lossy().ends_with(".part") && !e.snapshot.contains(&path) {
+                    println_flush!("🗑️ Deleting: {}", path.display());
+                    std::fs::remove_file(&path).ok();
                 }
             }
-            Err(e) => {
-                println_flush!("❌ Failed to read directory: {}", e);
-                Ok("Download cancelled".to_string())
-            }
         }
-    } else {
         Ok("Download cancelled".to_string())
+    } else {
+        Ok("Download cancelled (already stopped)".to_string())
     }
 }
 
@@ -176,6 +282,14 @@ fn get_ytdlp_command() -> Result<String, String> {
         "Failed to get app directory".to_string()
     })?;
     println_flush!("  📂 App directory: {}", app_dir.display());
+
+    // Check the managed tools directory first (downloaded by setup)
+    let tools_dir = get_tools_dir();
+    let managed_ytdlp = tools_dir.join("yt-dlp.exe");
+    if managed_ytdlp.exists() {
+        println_flush!("  ✅ Found managed yt-dlp in tools dir!");
+        return Ok(managed_ytdlp.to_string_lossy().to_string());
+    }
 
     // Try local executable names on Windows
     #[cfg(target_os = "windows")]
@@ -279,6 +393,8 @@ pub async fn download_video(url: String, format: Option<String>, download_path: 
     cmd.arg("--quiet")
         .arg("--no-warnings")
         .arg("--no-update");
+    #[cfg(target_os = "windows")]
+    cmd.creation_flags(0x08000000); // CREATE_NO_WINDOW
 
     // Add format if specified
     if let Some(fmt) = format {
@@ -359,17 +475,18 @@ pub async fn download_video_with_window(
     url: String,
     format: Option<String>,
     download_path: Option<String>,
+    download_id: String,
 ) -> Result<String, String> {
     println_flush!("\n========== DOWNLOAD_VIDEO (STREAMING - ASYNC) ==========");
-    println_flush!("📌 START");
+    println_flush!("📌 START [id={}]", download_id);
     println_flush!("📝 URL: {}", url);
     println_flush!("📝 Download Path: {:?}", download_path);
     println_flush!("📝 Format: {:?}", format);
 
-    let _ = window.emit("download-progress", serde_json::json!({ "status": "Finding yt-dlp..." }));
+    let _ = window.emit("download-progress", serde_json::json!({ "download_id": &download_id, "status": "Finding yt-dlp..." }));
 
     if url.trim().is_empty() {
-        let _ = window.emit("download-error", "URL is empty");
+        let _ = window.emit("download-error", serde_json::json!({ "download_id": &download_id, "message": "URL is empty" }));
         return Err("URL cannot be empty".to_string());
     }
 
@@ -384,29 +501,16 @@ pub async fn download_video_with_window(
     }
 
     let ytdlp_path = get_ytdlp_command()?;
-    let _ = window.emit("download-progress", serde_json::json!({ "status": "Getting filename..." }));
+    let _ = window.emit("download-progress", serde_json::json!({ "download_id": &download_id, "status": "Starting download..." }));
 
-    // Use original video title as filename (supports any language/Unicode)
-    // Store the download directory so cancel can find and delete the newest .part file
-    {
-        let mut dir_guard = DOWNLOAD_DIR.lock().await;
-        *dir_guard = Some(target_path.clone());
-        println_flush!("📁 Stored download directory: {}", target_path.display());
-
-        // Snapshot only NON-.part files before download starts
-        // This ensures resumed .part files from previous sessions are also cleaned up on cancel
-        let snapshot: std::collections::HashSet<PathBuf> = std::fs::read_dir(&target_path)
-            .map(|entries| entries.flatten()
-                .map(|e| e.path())
-                .filter(|p| !p.to_string_lossy().ends_with(".part"))
-                .collect())
-            .unwrap_or_default();
-        let mut snap_guard = DOWNLOAD_PRE_SNAPSHOT.lock().await;
-        *snap_guard = snapshot;
-        println_flush!("📸 Snapshotted {} existing non-.part files", snap_guard.len());
-    }
-
-    let _ = window.emit("download-progress", serde_json::json!({ "status": "Starting download..." }));
+    // Snapshot non-.part files so cancel can identify new .part files to delete
+    let snapshot: std::collections::HashSet<PathBuf> = std::fs::read_dir(&target_path)
+        .map(|entries| entries.flatten()
+            .map(|e| e.path())
+            .filter(|p| !p.to_string_lossy().ends_with(".part"))
+            .collect())
+        .unwrap_or_default();
+    println_flush!("📸 Snapshotted {} non-.part files for [{}]", snapshot.len(), download_id);
 
     // Create async command
     let mut cmd = Command::new(&ytdlp_path);
@@ -414,6 +518,8 @@ pub async fn download_video_with_window(
         .arg("--no-warnings")
         .arg("--no-update")
         .arg("--newline");
+    #[cfg(target_os = "windows")]
+    cmd.creation_flags(0x08000000); // CREATE_NO_WINDOW
 
     if let Some(fmt) = format {
         cmd.arg("-f").arg(fmt);
@@ -433,7 +539,7 @@ pub async fn download_video_with_window(
         Ok(c) => c,
         Err(e) => {
             let err_msg = format!("Failed to spawn: {}", e);
-            let _ = window.emit("download-error", &err_msg);
+            let _ = window.emit("download-error", serde_json::json!({ "download_id": &download_id, "message": &err_msg }));
             return Err(err_msg);
         }
     };
@@ -442,37 +548,35 @@ pub async fn download_video_with_window(
     let stdout = match child.stdout.take() {
         Some(s) => s,
         None => {
-            let _ = window.emit("download-error", "Failed to capture stdout");
+            let _ = window.emit("download-error", serde_json::json!({ "download_id": &download_id, "message": "Failed to capture stdout" }));
             return Err("Failed to capture stdout".to_string());
         }
     };
 
-    // Store child process and PID in global state for cancel/pause control
+    // Register in the per-download map (used by pause/cancel)
     {
-        let pid = child.id();
-        println_flush!("📌 Child spawned with PID: {:?}", pid);
-
-        let mut state = DOWNLOAD_STATE.lock().await;
-        *state = Some(child);
-        println_flush!("📌 Stored child process");
-
-        let mut pid_state = DOWNLOAD_PID.lock().await;
-        *pid_state = pid;
-        println_flush!("📌 Stored PID: {:?}", *pid_state);
+        let pid = child.id().unwrap_or(0);
+        println_flush!("📌 Child PID {} registered for [{}]", pid, download_id);
+        DOWNLOADS.lock().await.insert(download_id.clone(), DownloadEntry {
+            pid,
+            dir: target_path.clone(),
+            snapshot,
+        });
     }
 
     let mut reader = BufReader::new(stdout);
-    let mut line = String::new();
+    let mut buf: Vec<u8> = Vec::new();
 
-    // Read stdout line by line asynchronously
+    // Read stdout line by line asynchronously (byte-level to handle non-UTF-8 output)
     loop {
-        line.clear();
-        match reader.read_line(&mut line).await {
+        buf.clear();
+        match reader.read_until(b'\n', &mut buf).await {
             Ok(0) => {
                 println_flush!("📖 EOF reached");
                 break; // EOF
             }
             Ok(_) => {
+                let line = String::from_utf8_lossy(&buf);
                 let trimmed = line.trim();
                 if !trimmed.is_empty() {
                     // Parse yt-dlp progress format: [download] 45.2% of ~120.50MiB at 5.20MiB/s ETA 00:23
@@ -484,6 +588,7 @@ pub async fn download_video_with_window(
                                 if let Ok(percent) = last_part.parse::<f32>() {
                                     println_flush!("📊 Parsed progress: {}%", percent);
                                     let _ = window.emit("download-progress", serde_json::json!({
+                                        "download_id": &download_id,
                                         "progress": percent,
                                         "status": trimmed
                                     }));
@@ -492,92 +597,104 @@ pub async fn download_video_with_window(
                             }
                         }
                         let _ = window.emit("download-progress", serde_json::json!({
+                            "download_id": &download_id,
                             "status": trimmed
                         }));
                     } else if trimmed.contains("[ffmpeg]") {
                         let _ = window.emit("download-progress", serde_json::json!({
+                            "download_id": &download_id,
                             "status": "Merging streams..."
                         }));
                     } else {
                         let _ = window.emit("download-progress", serde_json::json!({
+                            "download_id": &download_id,
                             "status": trimmed
                         }));
                     }
                 }
             }
             Err(e) => {
-                // Check if this is because the process was killed
-                let err_str = e.to_string();
-                println_flush!("⚠️ Read error: {}", err_str);
-
-                // Check if child is still in state (was it killed?)
-                let state = DOWNLOAD_STATE.lock().await;
-                if state.is_none() {
-                    println_flush!("✅ Process was killed by cancel");
-                    let _ = window.emit("download-error", "Download cancelled by user");
-                    // Don't clear DOWNLOAD_DIR - let cancel_download delete the file
-                    // Just wait for child.wait() to finish below
+                println_flush!("⚠️ Read error [{}]: {}", download_id, e);
+                // If entry was removed it means pause/cancel killed the process
+                let was_killed = !DOWNLOADS.lock().await.contains_key(&download_id);
+                if was_killed {
+                    println_flush!("✅ Killed by pause/cancel [{}]", download_id);
                     break;
                 }
-                drop(state);
-
                 let err_msg = format!("Error reading output: {}", e);
-                let _ = window.emit("download-error", &err_msg);
-                let mut state = DOWNLOAD_STATE.lock().await;
-                *state = None;
+                let _ = window.emit("download-error", serde_json::json!({ "download_id": &download_id, "message": &err_msg }));
+                DOWNLOADS.lock().await.remove(&download_id);
                 return Err(err_msg);
             }
         }
     }
 
-    // Wait for child process to finish
-    let mut state = DOWNLOAD_STATE.lock().await;
-    let status = match state.take() {
-        Some(mut child) => {
-            match child.wait().await {
-                Ok(status) => status,
-                Err(e) => {
-                    let err_msg = format!("Failed to wait for child: {}", e);
-                    let _ = window.emit("download-error", &err_msg);
-                    // Clear PID only, NOT FILE (let cancel_download handle it)
-                    let mut pid_state = DOWNLOAD_PID.lock().await;
-                    *pid_state = None;
-                    return Err(err_msg);
-                }
-            }
-        }
-        None => {
-            // If child is None, it was probably killed by pause/cancel
-            // Don't emit error - let the pause/cancel function handle the message
-            // Clear PID only, NOT FILE (let cancel_download handle it)
-            let mut pid_state = DOWNLOAD_PID.lock().await;
-            *pid_state = None;
-            return Err("Download was paused or cancelled".to_string());
+    // Wait for the process to fully exit
+    let status = match child.wait().await {
+        Ok(s) => s,
+        Err(e) => {
+            let err_msg = format!("Failed to wait for child: {}", e);
+            let _ = window.emit("download-error", serde_json::json!({ "download_id": &download_id, "message": &err_msg }));
+            DOWNLOADS.lock().await.remove(&download_id);
+            return Err(err_msg);
         }
     };
-    drop(state); // Release lock before checking status
+
+    // If entry was already removed by pause/cancel, don't treat as error/success
+    let entry = DOWNLOADS.lock().await.remove(&download_id);
+    if entry.is_none() {
+        return Err("Download was paused or cancelled".to_string());
+    }
 
     if status.success() {
-        // Clear download info on success
-        {
-            let mut pid_state = DOWNLOAD_PID.lock().await;
-            *pid_state = None;
-            let mut dir_guard = DOWNLOAD_DIR.lock().await;
-            *dir_guard = None;
-        }
+        // Find the newly created file by diffing against the pre-download snapshot
+        let file_path: Option<String> = entry.and_then(|e| {
+            println_flush!("🔍 Searching for new files in: {}", e.dir.display());
+            println_flush!("📸 Snapshot has {} files", e.snapshot.len());
+
+            match std::fs::read_dir(&e.dir) {
+                Ok(entries) => {
+                    let new_files: Vec<_> = entries.flatten()
+                        .map(|ent| ent.path())
+                        .filter(|p| {
+                            let is_new = !p.to_string_lossy().ends_with(".part") && !e.snapshot.contains(p);
+                            if is_new {
+                                println_flush!("  ✓ New file: {}", p.display());
+                            }
+                            is_new
+                        })
+                        .collect();
+
+                    if new_files.is_empty() {
+                        println_flush!("  ❌ No new files found!");
+                        return None;
+                    }
+
+                    new_files.into_iter().max_by_key(|p| p.metadata().and_then(|m| m.modified()).ok())
+                }
+                Err(e) => {
+                    println_flush!("  ❌ Failed to read directory: {}", e);
+                    None
+                }
+            }
+        }).map(|p| {
+            let path_str = p.to_string_lossy().to_string();
+            println_flush!("✅ Selected file: {}", path_str);
+            path_str
+        });
+
+        println_flush!("📁 Final result: {:?}", file_path);
         let msg = format!("✓ Video downloaded successfully to: {}", target_path.display());
-        let _ = window.emit("download-complete", &msg);
-        println_flush!("✅ SUCCESS");
+        let _ = window.emit("download-complete", serde_json::json!({
+            "download_id": &download_id,
+            "message": &msg,
+            "file_path": file_path
+        }));
+        println_flush!("✅ SUCCESS [{}]", download_id);
         Ok(msg)
     } else {
-        // On failure, keep DOWNLOAD_DIR set so cancel can still delete incomplete files
-        // But clear PID since process is done
-        {
-            let mut pid_state = DOWNLOAD_PID.lock().await;
-            *pid_state = None;
-        }
         let err_msg = format!("Download failed with exit code: {}", status.code().unwrap_or(-1));
-        let _ = window.emit("download-error", &err_msg);
+        let _ = window.emit("download-error", serde_json::json!({ "download_id": &download_id, "message": &err_msg }));
         Err(err_msg)
     }
 }
@@ -612,16 +729,20 @@ pub async fn get_video_formats_with_window(
     let result = tokio::task::spawn_blocking(move || {
         use std::process::{Command, Stdio};
         use std::io::BufRead;
+        #[cfg(target_os = "windows")]
+        use std::os::windows::process::CommandExt;
 
-        let mut child = match Command::new(&ytdlp_path_clone)
-            .arg("-F")
+        let mut cmd = Command::new(&ytdlp_path_clone);
+        cmd.arg("-F")
             .arg("--no-playlist")
             .arg("--no-warnings")
             .arg(&url_clone)
             .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .spawn()
-        {
+            .stderr(Stdio::piped());
+        #[cfg(target_os = "windows")]
+        cmd.creation_flags(0x08000000); // CREATE_NO_WINDOW
+
+        let mut child = match cmd.spawn() {
             Ok(c) => c,
             Err(e) => return Err(format!("Failed to spawn: {}", e)),
         };
@@ -642,14 +763,16 @@ pub async fn get_video_formats_with_window(
         let mut all_output = String::new();
         let mut stderr_output = String::new();
 
-        // Read stdout
-        for line in reader.lines() {
-            match line {
-                Ok(line) => {
+        // Read stdout byte-by-byte to tolerate non-UTF-8 (e.g. Arabic titles)
+        for raw in reader.split(b'\n') {
+            match raw {
+                Ok(bytes) => {
+                    let line = String::from_utf8_lossy(&bytes);
+                    let line = line.trim_end_matches('\r');
                     if !line.is_empty() {
-                        all_output.push_str(&line);
+                        all_output.push_str(line);
                         all_output.push('\n');
-                        let _ = window_clone.emit("format-output", line);
+                        let _ = window_clone.emit("format-output", line.to_string());
                     }
                 }
                 Err(e) => {
@@ -660,12 +783,14 @@ pub async fn get_video_formats_with_window(
             }
         }
 
-        // Read stderr
-        for line in stderr_reader.lines() {
-            match line {
-                Ok(line) => {
+        // Read stderr byte-by-byte
+        for raw in stderr_reader.split(b'\n') {
+            match raw {
+                Ok(bytes) => {
+                    let line = String::from_utf8_lossy(&bytes);
+                    let line = line.trim_end_matches('\r');
                     if !line.is_empty() {
-                        stderr_output.push_str(&line);
+                        stderr_output.push_str(line);
                         stderr_output.push('\n');
                         let _ = window_clone.emit("format-output", format!("⚠️  {}", line));
                     }
@@ -753,10 +878,13 @@ pub async fn get_video_formats(url: String) -> Result<String, String> {
     let url_clone = url.clone();
 
     let result = tokio::task::spawn_blocking(move || {
-        std::process::Command::new(&ytdlp_path_clone)
-            .arg("-F")
-            .arg(&url_clone)
-            .output()
+        #[cfg(target_os = "windows")]
+        use std::os::windows::process::CommandExt;
+        let mut cmd = std::process::Command::new(&ytdlp_path_clone);
+        cmd.arg("-F").arg(&url_clone);
+        #[cfg(target_os = "windows")]
+        cmd.creation_flags(0x08000000);
+        cmd.output()
     })
     .await;
 
@@ -807,4 +935,108 @@ pub async fn get_video_formats(url: String) -> Result<String, String> {
         println_flush!("========== END ==========\n");
         Err(error_detail)
     }
+}
+
+/// Open a file with the default application
+pub async fn open_file(path: String) -> Result<(), String> {
+    println_flush!("📂 open_file: {}", path);
+    #[cfg(target_os = "windows")]
+    {
+        std::process::Command::new("cmd")
+            .args(&["/c", "start", "", &path])
+            .spawn()
+            .map_err(|e| format!("Failed to open file: {}", e))?;
+    }
+    #[cfg(target_os = "macos")]
+    {
+        std::process::Command::new("open")
+            .arg(&path)
+            .spawn()
+            .map_err(|e| format!("Failed to open file: {}", e))?;
+    }
+    #[cfg(target_os = "linux")]
+    {
+        std::process::Command::new("xdg-open")
+            .arg(&path)
+            .spawn()
+            .map_err(|e| format!("Failed to open file: {}", e))?;
+    }
+    Ok(())
+}
+
+/// Reveal a file in the system file manager
+pub async fn reveal_in_folder(path: String) -> Result<(), String> {
+    println_flush!("📁 reveal_in_folder: {}", path);
+    #[cfg(target_os = "windows")]
+    {
+        std::process::Command::new("explorer")
+            .args(&["/select,", &path])
+            .spawn()
+            .map_err(|e| format!("Failed to reveal in folder: {}", e))?;
+    }
+    #[cfg(target_os = "macos")]
+    {
+        std::process::Command::new("open")
+            .args(&["-R", &path])
+            .spawn()
+            .map_err(|e| format!("Failed to reveal in folder: {}", e))?;
+    }
+    #[cfg(target_os = "linux")]
+    {
+        if let Some(parent) = std::path::Path::new(&path).parent() {
+            std::process::Command::new("xdg-open")
+                .arg(parent)
+                .spawn()
+                .map_err(|e| format!("Failed to reveal in folder: {}", e))?;
+        }
+    }
+    Ok(())
+}
+
+/// Fetch video metadata (title, thumbnail, duration, filesize) using yt-dlp --dump-json
+pub async fn get_video_info(url: String) -> Result<VideoInfo, String> {
+    if url.trim().is_empty() {
+        return Err("URL cannot be empty".to_string());
+    }
+
+    let ytdlp_path = get_ytdlp_command()?;
+    let url_clone = url.clone();
+    let ytdlp_clone = ytdlp_path.clone();
+
+    let result = tokio::task::spawn_blocking(move || {
+        #[cfg(target_os = "windows")]
+        use std::os::windows::process::CommandExt;
+        let mut cmd = std::process::Command::new(&ytdlp_clone);
+        cmd.args(&["--dump-json", "--no-playlist", "--no-warnings"])
+            .arg(&url_clone);
+        #[cfg(target_os = "windows")]
+        cmd.creation_flags(0x08000000);
+        cmd.output()
+    })
+    .await
+    .map_err(|e| format!("Task error: {}", e))?
+    .map_err(|e| format!("Failed to run yt-dlp: {}", e))?;
+
+    if !result.status.success() {
+        let stderr = String::from_utf8_lossy(&result.stderr);
+        let msg = stderr.lines().next().unwrap_or("Unknown error").to_string();
+        return Err(msg);
+    }
+
+    let json_str = String::from_utf8_lossy(&result.stdout);
+    let first_line = json_str.lines().next().unwrap_or("{}");
+
+    let json: serde_json::Value = serde_json::from_str(first_line)
+        .map_err(|e| format!("Failed to parse response: {}", e))?;
+
+    Ok(VideoInfo {
+        title: json["title"].as_str().unwrap_or("Unknown").to_string(),
+        thumbnail: json["thumbnail"].as_str().map(|s| s.to_string()),
+        duration: json["duration"].as_f64(),
+        filesize: json["filesize"].as_i64()
+            .or_else(|| json["filesize_approx"].as_i64()),
+        ext: json["ext"].as_str().map(|s| s.to_string()),
+        width: json["width"].as_u64(),
+        height: json["height"].as_u64(),
+    })
 }

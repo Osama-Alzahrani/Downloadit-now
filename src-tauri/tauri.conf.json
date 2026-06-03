@@ -1,17 +1,17 @@
 {
-  "productName": "YouTube Downloader",
+  "productName": "Downloadit",
   "version": "0.1.0",
-  "identifier": "com.downloadit.app",
+  "identifier": "com.downloadit.desktop",
   "build": {
     "beforeDevCommand": "npm run dev",
     "beforeBuildCommand": "npm run build",
     "devUrl": "http://localhost:1420",
-    "frontendDist": "../../dist"
+    "frontendDist": "../dist"
   },
   "app": {
     "windows": [
       {
-        "title": "YouTube Downloader",
+        "title": "Downloadit",
         "width": 900,
         "height": 600,
         "resizable": true,
@@ -28,16 +28,33 @@
           "permissions": [
             "dialog:allow-open",
             "core:event:allow-listen",
-            "core:event:allow-emit"
+            "core:event:allow-emit",
+            "updater:allow-check",
+            "updater:allow-download-and-install",
+            "process:allow-restart"
           ]
         }
       ]
     }
   },
+  "plugins": {
+    "updater": {
+      "pubkey": "REPLACE_WITH_YOUR_PUBLIC_KEY",
+      "endpoints": [
+        "https://github.com/REPLACE_WITH_YOUR_USERNAME/REPLACE_WITH_YOUR_REPO/releases/latest/download/latest.json"
+      ],
+      "dialog": false
+    }
+  },
   "bundle": {
     "active": true,
-    "targets": [
-      "msi"
+    "targets": ["msi"],
+    "icon": [
+      "icons/32x32.png",
+      "icons/128x128.png",
+      "icons/128x128@2x.png",
+      "icons/icon.ico",
+      "icons/icon.icns"
     ]
   }
 }
