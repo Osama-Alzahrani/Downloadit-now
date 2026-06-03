@@ -27,6 +27,13 @@ jobs:
         uses: Swatinem/rust-cache@v2
         with:
           workspaces: './src-tauri -> target'
+          cache-on-failure: true
+
+      - name: Cache WiX toolset
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/tauri
+          key: wix-${{ runner.os }}
 
       - name: Install frontend dependencies
         run: npm install
