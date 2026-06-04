@@ -3,7 +3,7 @@
 
     <!-- Setup Overlay -->
     <div v-if="setup.visible" class="absolute inset-0 z-50 flex flex-col items-center justify-center bg-gray-950/95 backdrop-blur">
-      <img :src="lockupSvg" alt="Downloadit" class="h-12 w-auto mb-8" />
+      <img :src="lockupSvg" alt="Downloadit Now" class="h-12 w-auto mb-8" />
 
       <div v-if="setup.error" class="text-center px-8">
         <p class="text-red-400 font-semibold mb-2">Setup failed</p>
@@ -47,7 +47,7 @@
     <!-- Header Bar -->
     <div class="bg-linear-to-r from-gray-900 to-slate-900 border-b border-teal-500/20 px-6 py-4 shadow-lg">
       <div class="flex items-center justify-between">
-        <img :src="lockupSvg" alt="Downloadit" class="h-9 w-auto" />
+        <img :src="lockupSvg" alt="Downloadit Now" class="h-9 w-auto" />
         <div v-if="update.available && !update.installing" class="flex items-center gap-3">
           <span class="text-xs text-gray-400">v{{ update.version }} available</span>
           <button @click="installUpdate"

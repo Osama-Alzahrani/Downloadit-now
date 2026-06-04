@@ -1,6 +1,6 @@
 {
-  "productName": "Downloadit",
-  "version": "0.2.5",
+  "productName": "Downloadit Now",
+  "version": "0.2.6",
   "identifier": "com.downloadit.desktop",
   "build": {
     "beforeDevCommand": "npm run dev",
@@ -11,7 +11,7 @@
   "app": {
     "windows": [
       {
-        "title": "Downloadit",
+        "title": "Downloadit Now",
         "width": 900,
         "height": 600,
         "resizable": true,

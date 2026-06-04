@@ -53,7 +53,7 @@ fn kill_pid(pid: u32) {
 pub fn get_tools_dir() -> PathBuf {
     dirs::data_local_dir()
         .unwrap_or_else(|| PathBuf::from("."))
-        .join("Downloadit")
+        .join("Downloadit Now")
         .join("bin")
 }
 
@@ -80,7 +80,7 @@ async fn download_file_with_progress(
 ) -> Result<(), String> {
     let resp = client
         .get(url)
-        .header("User-Agent", "Downloadit/1.0")
+        .header("User-Agent", "Downloadit Now/1.0")
         .send()
         .await
         .map_err(|e| format!("Request failed: {}", e))?;
@@ -119,7 +119,7 @@ async fn download_file_with_progress(
 async fn get_ffmpeg_download_url(client: &reqwest::Client) -> Result<String, String> {
     let json: serde_json::Value = client
         .get("https://api.github.com/repos/BtbN/FFmpeg-Builds/releases/latest")
-        .header("User-Agent", "Downloadit/1.0")
+        .header("User-Agent", "Downloadit Now/1.0")
         .send()
         .await
         .map_err(|e| e.to_string())?
