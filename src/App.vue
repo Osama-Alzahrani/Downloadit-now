@@ -55,12 +55,17 @@
             ↑ Update
           </button>
         </div>
-        <div v-if="update.installing" class="flex items-center gap-2 text-xs text-gray-400">
-          <svg class="w-3.5 h-3.5 animate-spin text-teal-400" fill="none" viewBox="0 0 24 24">
-            <circle class="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" stroke-width="4"/>
-            <path class="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8v8z"/>
-          </svg>
-          {{ update.status }}
+        <div v-if="update.installing" class="flex items-center gap-3">
+          <div class="flex flex-col items-end gap-1">
+            <div class="flex items-center justify-between w-48 text-xs text-gray-400">
+              <span>{{ update.status }}</span>
+              <span class="font-semibold text-teal-400">{{ update.progress }}%</span>
+            </div>
+            <div class="w-48 h-1.5 bg-gray-700 rounded-full overflow-hidden">
+              <div class="h-full bg-teal-500 rounded-full transition-all duration-200"
+                :style="{ width: update.progress + '%' }" />
+            </div>
+          </div>
         </div>
       </div>
     </div>
@@ -86,29 +91,33 @@ import { relaunch } from '@tauri-apps/plugin-process'
 import MainDownloader from './components/MainDownloader.vue'
 import lockupSvg from './assets/downloadit-lockup.svg'
 
+let _updateHandle = null  // kept outside reactive to avoid Proxy wrapping private fields
+
 const update = reactive({
   available: false,
   version: '',
   installing: false,
+  progress: 0,
   status: '',
-  _handle: null,
 })
 
 const installUpdate = async () => {
-  if (!update._handle) return
+  if (!_updateHandle) return
   update.installing = true
-  update.status = 'Downloading…'
+  update.progress = 0
+  update.status = 'Starting…'
   let downloaded = 0
   let total = 0
-  await update._handle.downloadAndInstall((event) => {
+  await _updateHandle.downloadAndInstall((event) => {
     if (event.event === 'Started') {
       total = event.data.contentLength ?? 0
+      update.status = 'Downloading…'
     } else if (event.event === 'Progress') {
       downloaded += event.data.chunkLength
-      if (total > 0) {
-        update.status = `Downloading… ${Math.round(downloaded / total * 100)}%`
-      }
+      update.progress = total > 0 ? Math.round(downloaded / total * 100) : 0
+      update.status = 'Downloading…'
     } else if (event.event === 'Finished') {
+      update.progress = 100
       update.status = 'Restarting…'
     }
   })
@@ -121,7 +130,7 @@ const checkForUpdates = async () => {
     if (result?.available) {
       update.available = true
       update.version = result.version
-      update._handle = result
+      _updateHandle = result
     }
   } catch {
     // silently ignore — updater not configured yet or no network
