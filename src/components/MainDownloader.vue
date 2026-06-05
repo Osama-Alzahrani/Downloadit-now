@@ -265,6 +265,8 @@ import { invoke } from '@tauri-apps/api/core'
 import { listen } from '@tauri-apps/api/event'
 import { open } from '@tauri-apps/plugin-dialog'
 
+const emit = defineEmits(['history-update'])
+
 const url = ref('')
 const downloadPath = ref(null)
 const queue = ref([])
@@ -614,6 +616,28 @@ const formatFilesize = (bytes) => {
   return `${(bytes / 1024).toFixed(1)}KB`
 }
 
+const saveToHistory = (item, filePath) => {
+  try {
+    const history = JSON.parse(localStorage.getItem('downloadHistory') || '[]')
+    history.unshift({
+      id: `${Date.now()}-${item.id}`,
+      url: item.url,
+      title: item.title,
+      thumbnail: item.thumbnail,
+      filePath: filePath || null,
+      ext: item.ext,
+      width: item.width,
+      height: item.height,
+      duration: item.duration,
+      selectedFormatLabel: item.selectedFormatLabel,
+      downloadedAt: new Date().toISOString(),
+    })
+    if (history.length > 200) history.splice(200)
+    localStorage.setItem('downloadHistory', JSON.stringify(history))
+    emit('history-update', history.length)
+  } catch {}
+}
+
 const clearCompleted = () => {
   queue.value = queue.value.filter(i => i.status !== 'completed' && i.status !== 'error')
 }
@@ -693,6 +717,7 @@ onMounted(async () => {
       item.progress = 100
       item.statusText = ''
       item.filePath = file_path || null
+      saveToHistory(item, file_path)
     }
     startNextIfIdle()
   })

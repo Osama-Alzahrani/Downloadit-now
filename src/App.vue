@@ -70,9 +70,33 @@
       </div>
     </div>
 
+    <!-- Tab Bar -->
+    <div class="flex border-b border-gray-700/50 px-6 bg-gray-900/20">
+      <button
+        @click="activeTab = 'downloads'"
+        class="px-4 py-2.5 text-sm font-medium transition-colors border-b-2 -mb-px"
+        :class="activeTab === 'downloads'
+          ? 'text-teal-400 border-teal-500'
+          : 'text-gray-500 border-transparent hover:text-gray-300'"
+      >
+        Downloads
+      </button>
+      <button
+        @click="activeTab = 'history'"
+        class="px-4 py-2.5 text-sm font-medium transition-colors border-b-2 -mb-px flex items-center gap-1.5"
+        :class="activeTab === 'history'
+          ? 'text-teal-400 border-teal-500'
+          : 'text-gray-500 border-transparent hover:text-gray-300'"
+      >
+        History
+        <span v-if="historyCount > 0" class="px-1.5 py-0.5 bg-gray-700 text-gray-400 text-xs rounded-full leading-none">{{ historyCount }}</span>
+      </button>
+    </div>
+
     <!-- Main Content -->
     <div class="flex-1 flex flex-col overflow-hidden p-4">
-      <MainDownloader />
+      <MainDownloader v-if="activeTab === 'downloads'" @history-update="onHistoryUpdate" />
+      <DownloadHistory v-else @history-update="onHistoryUpdate" />
     </div>
 
     <!-- Footer -->
@@ -89,7 +113,15 @@ import { listen } from '@tauri-apps/api/event'
 import { check } from '@tauri-apps/plugin-updater'
 import { relaunch } from '@tauri-apps/plugin-process'
 import MainDownloader from './components/MainDownloader.vue'
+import DownloadHistory from './components/DownloadHistory.vue'
 import lockupSvg from './assets/downloadit-lockup.svg'
+
+const activeTab = ref('downloads')
+const historyCount = ref(0)
+
+const onHistoryUpdate = (count) => {
+  historyCount.value = count
+}
 
 let _updateHandle = null  // kept outside reactive to avoid Proxy wrapping private fields
 
@@ -161,6 +193,11 @@ const runSetup = async () => {
 }
 
 onMounted(async () => {
+  try {
+    const h = JSON.parse(localStorage.getItem('downloadHistory') || '[]')
+    historyCount.value = h.length
+  } catch {}
+
   checkForUpdates()
 
   unlistenSetup = await listen('setup-progress', (event) => {
