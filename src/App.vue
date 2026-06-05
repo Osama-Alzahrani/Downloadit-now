@@ -101,7 +101,7 @@
 
     <!-- Footer -->
     <div class="bg-gray-900/50 border-t border-teal-500/20 px-6 py-3 text-xs text-gray-500 text-center">
-      💾 Desktop • ⚡ yt-dlp
+      💾 Desktop app • ⚡ Powered by yt-dlp • 1000+ supported sites
     </div>
   </div>
 </template>

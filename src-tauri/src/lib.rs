@@ -474,6 +474,7 @@ pub async fn download_video_with_window(
     window: tauri::Window,
     url: String,
     format: Option<String>,
+    audio_only: bool,
     download_path: Option<String>,
     download_id: String,
 ) -> Result<String, String> {
@@ -521,7 +522,11 @@ pub async fn download_video_with_window(
     #[cfg(target_os = "windows")]
     cmd.creation_flags(0x08000000); // CREATE_NO_WINDOW
 
-    if let Some(fmt) = format {
+    if audio_only {
+        cmd.arg("-f").arg("bestaudio/best")
+           .arg("-x")
+           .arg("--audio-format").arg("mp3");
+    } else if let Some(fmt) = format {
         cmd.arg("-f").arg(fmt);
     }
 
@@ -720,7 +725,7 @@ pub async fn get_video_formats_with_window(
     let _ = window.emit("format-output", format!("✅ Using: {}", ytdlp_path));
 
     let _ = window.emit("format-output", format!("🚀 Running: {} -F \"{}\"", ytdlp_path, url));
-    let _ = window.emit("format-output", "⏳ Waiting for YouTube response...");
+    let _ = window.emit("format-output", "⏳ Fetching available formats…");
 
     let ytdlp_path_clone = ytdlp_path.clone();
     let url_clone = url.clone();
@@ -871,7 +876,7 @@ pub async fn get_video_formats(url: String) -> Result<String, String> {
     println_flush!("✅ yt-dlp path: {}", ytdlp_path);
 
     println_flush!("🚀 Running: {} -F \"{}\"", ytdlp_path, url);
-    println_flush!("⏳ Fetching formats (waiting for YouTube response)...");
+    println_flush!("⏳ Fetching available formats…");
 
     // Use spawn_blocking to prevent hanging the async runtime
     let ytdlp_path_clone = ytdlp_path.clone();
@@ -991,6 +996,77 @@ pub async fn reveal_in_folder(path: String) -> Result<(), String> {
         }
     }
     Ok(())
+}
+
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct PlaylistEntry {
+    pub id: String,
+    pub title: String,
+    pub url: String,
+    pub duration: Option<f64>,
+    pub thumbnail: Option<String>,
+}
+
+/// Fetch all entries in a playlist using --flat-playlist --dump-json
+pub async fn get_playlist_info(url: String) -> Result<Vec<PlaylistEntry>, String> {
+    if url.trim().is_empty() {
+        return Err("URL cannot be empty".to_string());
+    }
+
+    let ytdlp_path = get_ytdlp_command()?;
+    let url_clone = url.clone();
+    let ytdlp_clone = ytdlp_path.clone();
+
+    let result = tokio::task::spawn_blocking(move || {
+        #[cfg(target_os = "windows")]
+        use std::os::windows::process::CommandExt;
+        let mut cmd = std::process::Command::new(&ytdlp_clone);
+        cmd.args(&["--flat-playlist", "--dump-json", "--no-warnings", "--no-update"])
+            .arg(&url_clone);
+        #[cfg(target_os = "windows")]
+        cmd.creation_flags(0x08000000);
+        cmd.output()
+    })
+    .await
+    .map_err(|e| format!("Task error: {}", e))?
+    .map_err(|e| format!("Failed to run yt-dlp: {}", e))?;
+
+    let stdout = String::from_utf8_lossy(&result.stdout);
+    let mut entries = Vec::new();
+
+    for line in stdout.lines() {
+        let trimmed = line.trim();
+        if trimmed.is_empty() { continue; }
+        let Ok(v) = serde_json::from_str::<serde_json::Value>(trimmed) else { continue };
+
+        let id = v["id"].as_str().unwrap_or("").to_string();
+        if id.is_empty() { continue; }
+
+        let title = v["title"].as_str().unwrap_or(&id).to_string();
+
+        let video_url = v["url"].as_str()
+            .map(|u| if u.starts_with("http") {
+                u.to_string()
+            } else {
+                format!("https://www.youtube.com/watch?v={}", id)
+            })
+            .unwrap_or_else(|| format!("https://www.youtube.com/watch?v={}", id));
+
+        let duration = v["duration"].as_f64();
+
+        let thumbnail = v["thumbnail"].as_str().map(String::from)
+            .or_else(|| Some(format!("https://i.ytimg.com/vi/{}/mqdefault.jpg", id)));
+
+        entries.push(PlaylistEntry { id, title, url: video_url, duration, thumbnail });
+    }
+
+    if entries.is_empty() {
+        let stderr = String::from_utf8_lossy(&result.stderr);
+        let msg = stderr.lines().find(|l| !l.trim().is_empty()).unwrap_or("No videos found in playlist").to_string();
+        return Err(msg);
+    }
+
+    Ok(entries)
 }
 
 /// Fetch video metadata (title, thumbnail, duration, filesize) using yt-dlp --dump-json

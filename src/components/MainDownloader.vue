@@ -6,7 +6,7 @@
         v-model="url"
         @keydown.enter="addToQueue"
         type="text"
-        placeholder="Paste YouTube URL and press Enter..."
+        placeholder="Paste any video URL (YouTube, TikTok, Instagram, Twitter/X, Vimeo…)"
         class="flex-1 px-3 py-2 bg-gray-800 border border-gray-700 text-gray-100 rounded-lg text-sm placeholder:text-gray-500 focus:outline-none focus:border-teal-500 focus:shadow-lg focus:shadow-teal-500/20 transition-all"
       />
       <button
@@ -42,13 +42,97 @@
     </div>
   </div>
 
+  <!-- Playlist Picker Modal -->
+  <Teleport to="body">
+    <div v-if="playlist.visible" class="fixed inset-0 z-50 flex items-center justify-center bg-gray-950/80 backdrop-blur p-4">
+      <div class="w-full max-w-2xl bg-gray-900 border border-gray-700/60 rounded-xl shadow-2xl flex flex-col max-h-[85vh]">
+
+        <!-- Header -->
+        <div class="flex items-start justify-between px-5 py-4 border-b border-gray-700/50 shrink-0">
+          <div class="min-w-0 pr-4">
+            <h2 class="text-sm font-bold text-gray-100 mb-0.5">Playlist detected</h2>
+            <p class="text-xs text-gray-500 truncate">{{ playlist.url }}</p>
+          </div>
+          <button @click="playlist.visible = false" class="text-gray-500 hover:text-gray-300 text-xl leading-none shrink-0 mt-0.5">×</button>
+        </div>
+
+        <!-- Loading -->
+        <div v-if="playlist.loading" class="flex flex-col items-center justify-center py-16 gap-3">
+          <div class="w-6 h-6 border-2 border-teal-500 border-t-transparent rounded-full animate-spin"></div>
+          <p class="text-xs text-gray-500">Fetching playlist…</p>
+        </div>
+
+        <!-- Error -->
+        <div v-else-if="playlist.error" class="px-5 py-10 text-center">
+          <p class="text-red-400 text-sm mb-5">{{ playlist.error }}</p>
+          <button @click="playlist.visible = false" class="px-4 py-2 bg-gray-700 hover:bg-gray-600 text-gray-300 text-xs font-semibold rounded-lg">Close</button>
+        </div>
+
+        <!-- Entries -->
+        <template v-else>
+          <!-- Toolbar -->
+          <div class="flex items-center justify-between px-5 py-2.5 border-b border-gray-700/30 shrink-0">
+            <div class="flex items-center gap-3 text-xs">
+              <span class="text-gray-400 font-medium">{{ playlist.entries.filter(e => e.selected).length }} / {{ playlist.entries.length }} selected</span>
+              <button @click="selectAll(true)" class="text-teal-400 hover:text-teal-300 transition-colors">All</button>
+              <button @click="selectAll(false)" class="text-gray-500 hover:text-gray-400 transition-colors">None</button>
+            </div>
+          </div>
+
+          <!-- Video list -->
+          <div class="overflow-y-auto flex-1 min-h-0">
+            <div
+              v-for="(entry, idx) in playlist.entries"
+              :key="entry.id"
+              class="flex items-center gap-3 px-4 py-2.5 border-b border-gray-800/50 hover:bg-gray-800/40 cursor-pointer transition-colors"
+              @click="entry.selected = !entry.selected"
+            >
+              <input
+                type="checkbox"
+                :checked="entry.selected"
+                class="accent-teal-500 shrink-0 w-3.5 h-3.5"
+                @click.stop="entry.selected = !entry.selected"
+              />
+              <span class="text-xs text-gray-600 w-6 text-right shrink-0 tabular-nums">{{ idx + 1 }}</span>
+              <img
+                v-if="entry.thumbnail"
+                :src="entry.thumbnail"
+                class="w-16 h-10 object-cover rounded shrink-0"
+                @error="e => e.target.style.display = 'none'"
+              />
+              <div v-else class="w-16 h-10 bg-gray-700 rounded shrink-0 flex items-center justify-center text-lg">🎬</div>
+              <div class="flex-1 min-w-0">
+                <p class="text-xs font-medium text-gray-200 truncate">{{ entry.title }}</p>
+                <p v-if="entry.duration" class="text-[10px] text-gray-500 mt-0.5">{{ formatDuration(entry.duration) }}</p>
+              </div>
+            </div>
+          </div>
+
+          <!-- Footer -->
+          <div class="flex items-center justify-between px-5 py-3 border-t border-gray-700/30 shrink-0">
+            <button @click="playlist.visible = false" class="px-4 py-1.5 bg-gray-700 hover:bg-gray-600 text-gray-300 text-xs font-semibold rounded-lg transition-colors">
+              Cancel
+            </button>
+            <button
+              @click="addSelectedFromPlaylist"
+              :disabled="!playlist.entries.some(e => e.selected)"
+              class="px-5 py-1.5 bg-teal-500 hover:bg-teal-600 disabled:opacity-40 disabled:cursor-not-allowed text-white text-xs font-semibold rounded-lg transition-colors"
+            >
+              ↓ Add {{ playlist.entries.filter(e => e.selected).length }} to Queue
+            </button>
+          </div>
+        </template>
+      </div>
+    </div>
+  </Teleport>
+
   <!-- Queue -->
   <div class="flex-1 overflow-y-auto space-y-2 min-h-0">
     <!-- Empty state -->
     <div v-if="queue.length === 0" class="flex flex-col items-center justify-center py-16 text-gray-600">
       <img src="../assets/downloadit-glyph.svg" alt="" class="mb-3 opacity-40" />
       <p class="text-sm font-medium mb-1">No downloads queued</p>
-      <p class="text-xs">Paste a YouTube URL above and press Enter</p>
+      <p class="text-xs">Paste any video URL above — YouTube, TikTok, Instagram, Vimeo and more</p>
     </div>
 
     <!-- Queue items -->
@@ -150,6 +234,14 @@
               class="px-2.5 py-1 bg-teal-500/20 hover:bg-teal-500/30 border border-teal-500/40 text-teal-300 text-xs font-semibold rounded transition-colors whitespace-nowrap"
             >
               ↓ Best
+            </button>
+            <!-- Audio only -->
+            <button
+              v-if="item.status === 'ready'"
+              @click="startAudio(item.id)"
+              class="px-2.5 py-1 bg-purple-500/20 hover:bg-purple-500/30 border border-purple-500/40 text-purple-300 text-xs font-semibold rounded transition-colors whitespace-nowrap"
+            >
+              ♪ MP3
             </button>
             <!-- Downloading: Pause + Cancel -->
             <template v-if="item.status === 'downloading'">
@@ -260,7 +352,7 @@
 </template>
 
 <script setup>
-import { ref, onMounted, watch } from 'vue'
+import { ref, reactive, onMounted, watch } from 'vue'
 import { invoke } from '@tauri-apps/api/core'
 import { listen } from '@tauri-apps/api/event'
 import { open } from '@tauri-apps/plugin-dialog'
@@ -271,6 +363,69 @@ const url = ref('')
 const downloadPath = ref(null)
 const queue = ref([])
 let idCounter = 0
+
+// Playlist picker state
+const playlist = reactive({
+  visible: false,
+  url: '',
+  loading: false,
+  error: null,
+  entries: [],  // { ...PlaylistEntry, selected: bool }
+})
+
+const isPlaylistUrl = (u) => {
+  try { return new URL(u).searchParams.has('list') } catch { return false }
+}
+
+const openPlaylistPicker = async (u) => {
+  playlist.url = u
+  playlist.visible = true
+  playlist.loading = true
+  playlist.error = null
+  playlist.entries = []
+  try {
+    const entries = await invoke('get_playlist_info', { url: u })
+    playlist.entries = entries.map(e => ({ ...e, selected: true }))
+  } catch (err) {
+    playlist.error = String(err)
+  } finally {
+    playlist.loading = false
+  }
+}
+
+const selectAll = (val) => playlist.entries.forEach(e => (e.selected = val))
+
+const addFromPlaylist = (entry) => {
+  const id = String(++idCounter)
+  queue.value.push({
+    id,
+    url: entry.url,
+    title: entry.title,
+    thumbnail: entry.thumbnail || null,
+    duration: entry.duration || null,
+    filesize: null,
+    ext: null,
+    width: null,
+    height: null,
+    selectedFormat: null,
+    selectedFormatLabel: null,
+    audioOnly: false,
+    progress: 0,
+    status: 'ready',
+    statusText: '',
+    error: null,
+    filePath: null,
+    showFormats: false,
+    loadingFormats: false,
+    formatTable: [],
+    formatsError: null,
+  })
+}
+
+const addSelectedFromPlaylist = () => {
+  playlist.entries.filter(e => e.selected).forEach(addFromPlaylist)
+  playlist.visible = false
+}
 const concurrentLimit = ref(Number(localStorage.getItem('concurrentLimit') || 2))
 
 const setConcurrent = (n) => {
@@ -366,6 +521,12 @@ const addToQueue = async () => {
   if (!trimmed) return
 
   url.value = ''
+
+  if (isPlaylistUrl(trimmed)) {
+    openPlaylistPicker(trimmed)
+    return
+  }
+
   const id = String(++idCounter)
 
   queue.value.push({
@@ -501,6 +662,17 @@ const startBest = (itemId) => {
   if (!item) return
   item.selectedFormat = null
   item.selectedFormatLabel = null
+  item.audioOnly = false
+  enqueueItem(itemId)
+}
+
+const startAudio = (itemId) => {
+  const item = queue.value.find(i => i.id === itemId)
+  if (!item || item.status !== 'ready') return
+  item.selectedFormat = null
+  item.selectedFormatLabel = 'MP3 Audio'
+  item.audioOnly = true
+  item.showFormats = false
   enqueueItem(itemId)
 }
 
@@ -535,6 +707,7 @@ const startDownload = async (item) => {
         format: item.selectedFormat || null,
         download_path: downloadPath.value,
         download_id: item.id,
+        audio_only: item.audioOnly || false,
       }
     })
   } catch (err) {
