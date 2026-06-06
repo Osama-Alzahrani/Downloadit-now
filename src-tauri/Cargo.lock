@@ -907,7 +907,7 @@ dependencies = [
 
 [[package]]
 name = "downloadit"
-version = "0.2.91"
+version = "0.2.92"
 dependencies = [
  "dirs 5.0.1",
  "futures-util",
