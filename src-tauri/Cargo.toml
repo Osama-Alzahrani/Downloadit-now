@@ -1,6 +1,6 @@
-[package]
+﻿[package]
 name = "downloadit"
-version = "0.1.0"
+version = "0.2.91"
 description = "Ultra-lightweight YouTube downloader using yt-dlp"
 authors = ["you"]
 edition = "2021"
