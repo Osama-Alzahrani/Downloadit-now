@@ -31,7 +31,7 @@ $patched = $false
 Write-Host "  Cargo.toml       → $Version"
 
 # ── Commit, tag, push ────────────────────────────────────────────────────────
-git add src-tauri/tauri.conf.json src-tauri/Cargo.toml
+git add -A
 git commit -m "chore: release $tag"
 git tag $tag
 git push origin main
