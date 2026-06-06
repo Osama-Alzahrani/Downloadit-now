@@ -1,6 +1,6 @@
 {
   "productName": "Downloadit Now",
-  "version": "0.2.93",
+  "version": "0.2.94",
   "identifier": "com.downloadit.desktop",
   "build": {
     "beforeDevCommand": "npm run dev",
