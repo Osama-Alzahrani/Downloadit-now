@@ -84,6 +84,16 @@ jobs:
           Write-Host "=== Signing key present? ==="
           if ("${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}" -ne "") { Write-Host "YES" } else { Write-Host "NO — secret is empty!" }
 
+      # ── Rename bundle artifacts to remove spaces (GitHub converts spaces to dots) ─
+      - name: Rename artifacts
+        run: |
+          $bundleDir = "src-tauri/target/release/bundle/msi"
+          Get-ChildItem "$bundleDir" | Where-Object { $_.Name -match ' ' } | ForEach-Object {
+            $newName = $_.Name -replace ' ', '-'
+            Write-Host "Renaming: $($_.Name) → $newName"
+            Rename-Item $_.FullName $newName
+          }
+
       # ── Generate latest.json ─────────────────────────────────────────────────
       - name: Generate latest.json
         run: |
@@ -114,8 +124,8 @@ jobs:
           Write-Host "Signature: $($sig.Name)"
 
           $sigContent = (Get-Content $sig.FullName -Raw).Trim()
-          $encodedName = $artifact.Name -replace ' ', '%20'
-          $url = "https://github.com/${{ github.repository }}/releases/download/${{ github.ref_name }}/$encodedName"
+          # No spaces in name after rename step — use as-is
+          $url = "https://github.com/${{ github.repository }}/releases/download/${{ github.ref_name }}/$($artifact.Name)"
 
           [ordered]@{
             version   = $version
