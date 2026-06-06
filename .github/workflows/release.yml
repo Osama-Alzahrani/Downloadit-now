@@ -65,19 +65,28 @@ jobs:
           $version = "${{ steps.version.outputs.VERSION }}"
           $bundleDir = "src-tauri/target/release/bundle/msi"
 
-          $msiItem = Get-ChildItem "$bundleDir" -Filter "*.msi" | Where-Object { $_.Name -notlike "*.zip*" } | Select-Object -First 1
+          Write-Host "=== Files in bundle/msi ==="
+          Get-ChildItem "$bundleDir" -Recurse | Select-Object FullName, Length
 
-          # Tauri v2 may produce .msi.sig or .msi.zip.sig
-          $sigItem = Get-ChildItem "$bundleDir" -Recurse -Filter "*.sig" | Select-Object -First 1
+          # Tauri v2 updater artifact: .msi.zip (what the client downloads) + .msi.zip.sig
+          $zipItem = Get-ChildItem "$bundleDir" -Filter "*.msi.zip" | Where-Object { $_.Name -notlike "*.sig*" } | Select-Object -First 1
+          $sigItem = Get-ChildItem "$bundleDir" -Filter "*.msi.zip.sig" | Select-Object -First 1
 
-          if (-not $msiItem) { Write-Error "MSI not found in $bundleDir"; exit 1 }
-          if (-not $sigItem) { Write-Error "No .sig file found anywhere — is TAURI_SIGNING_PRIVATE_KEY set correctly?"; exit 1 }
+          # Fallback: some Tauri versions produce .msi + .msi.sig instead
+          if (-not $zipItem) {
+            Write-Host "No .msi.zip found, falling back to raw .msi"
+            $zipItem = Get-ChildItem "$bundleDir" -Filter "*.msi" | Where-Object { $_.Name -notlike "*.zip*" } | Select-Object -First 1
+            $sigItem = Get-ChildItem "$bundleDir" -Filter "*.msi.sig" | Select-Object -First 1
+          }
 
-          Write-Host "MSI: $($msiItem.Name)"
-          Write-Host "Sig: $($sigItem.Name)"
+          if (-not $zipItem) { Write-Error "No MSI artifact found in $bundleDir"; exit 1 }
+          if (-not $sigItem) { Write-Error "No matching .sig file found — is TAURI_SIGNING_PRIVATE_KEY set?"; exit 1 }
+
+          Write-Host "Artifact : $($zipItem.Name)"
+          Write-Host "Signature: $($sigItem.Name)"
 
           $sig = Get-Content $sigItem.FullName -Raw
-          $url = "https://github.com/${{ github.repository }}/releases/download/${{ github.ref_name }}/$($msiItem.Name)"
+          $url = "https://github.com/${{ github.repository }}/releases/download/${{ github.ref_name }}/$($zipItem.Name)"
 
           $json = [ordered]@{
             version  = $version
@@ -92,7 +101,7 @@ jobs:
           } | ConvertTo-Json -Depth 10
 
           $json | Out-File -FilePath "latest.json" -Encoding utf8NoBOM
-          Write-Host "Generated latest.json:"
+          Write-Host "=== latest.json ==="
           Get-Content latest.json
 
       - name: Create GitHub Release
@@ -100,6 +109,8 @@ jobs:
         with:
           name: "Downloadit Now v${{ steps.version.outputs.VERSION }}"
           generate_release_notes: true
+          fail_on_unmatched_files: false
           files: |
             src-tauri/target/release/bundle/msi/*.msi
+            src-tauri/target/release/bundle/msi/*.msi.zip
             latest.json

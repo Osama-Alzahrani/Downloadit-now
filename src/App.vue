@@ -48,13 +48,25 @@
     <div class="bg-linear-to-r from-gray-900 to-slate-900 border-b border-teal-500/20 px-6 py-4 shadow-lg">
       <div class="flex items-center justify-between">
         <img :src="lockupSvg" alt="Downloadit Now" class="h-9 w-auto" />
-        <div v-if="update.available && !update.installing" class="flex items-center gap-3">
+        <!-- Update available -->
+        <div v-if="update.available && !update.installing && !update.error" class="flex items-center gap-3">
           <span class="text-xs text-gray-400">v{{ update.version }} available</span>
           <button @click="installUpdate"
             class="px-3 py-1.5 bg-teal-500 hover:bg-teal-600 text-white text-xs font-semibold rounded-lg transition-colors">
             ↑ Update
           </button>
         </div>
+        <!-- Install error -->
+        <div v-if="update.error" class="flex items-center gap-2 max-w-sm">
+          <span class="text-xs text-red-400 truncate" :title="update.error">⚠ {{ update.error }}</span>
+          <button @click="update.error = ''" class="text-gray-600 hover:text-gray-400 text-sm leading-none shrink-0">×</button>
+        </div>
+        <!-- Check error (debug) -->
+        <div v-if="update.checkError && !update.available" class="flex items-center gap-2 max-w-sm">
+          <span class="text-xs text-yellow-600 truncate" :title="update.checkError">⚠ Update check: {{ update.checkError }}</span>
+          <button @click="update.checkError = ''" class="text-gray-600 hover:text-gray-400 text-sm leading-none shrink-0">×</button>
+        </div>
+        <!-- Installing progress -->
         <div v-if="update.installing" class="flex items-center gap-3">
           <div class="flex flex-col items-end gap-1">
             <div class="flex items-center justify-between w-48 text-xs text-gray-400">
@@ -131,29 +143,37 @@ const update = reactive({
   installing: false,
   progress: 0,
   status: '',
+  error: '',      // shown when install fails
+  checkError: '', // shown when update check fails (debug)
 })
 
 const installUpdate = async () => {
   if (!_updateHandle) return
   update.installing = true
+  update.error = ''
   update.progress = 0
   update.status = 'Starting…'
   let downloaded = 0
   let total = 0
-  await _updateHandle.downloadAndInstall((event) => {
-    if (event.event === 'Started') {
-      total = event.data.contentLength ?? 0
-      update.status = 'Downloading…'
-    } else if (event.event === 'Progress') {
-      downloaded += event.data.chunkLength
-      update.progress = total > 0 ? Math.round(downloaded / total * 100) : 0
-      update.status = 'Downloading…'
-    } else if (event.event === 'Finished') {
-      update.progress = 100
-      update.status = 'Restarting…'
-    }
-  })
-  await relaunch()
+  try {
+    await _updateHandle.downloadAndInstall((event) => {
+      if (event.event === 'Started') {
+        total = event.data.contentLength ?? 0
+        update.status = 'Downloading…'
+      } else if (event.event === 'Progress') {
+        downloaded += event.data.chunkLength
+        update.progress = total > 0 ? Math.round(downloaded / total * 100) : 0
+        update.status = 'Downloading…'
+      } else if (event.event === 'Finished') {
+        update.progress = 100
+        update.status = 'Restarting…'
+      }
+    })
+    await relaunch()
+  } catch (e) {
+    update.installing = false
+    update.error = String(e)
+  }
 }
 
 const checkForUpdates = async () => {
@@ -164,8 +184,8 @@ const checkForUpdates = async () => {
       update.version = result.version
       _updateHandle = result
     }
-  } catch {
-    // silently ignore — updater not configured yet or no network
+  } catch (e) {
+    update.checkError = String(e)
   }
 }
 
