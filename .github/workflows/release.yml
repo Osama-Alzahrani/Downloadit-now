@@ -14,6 +14,33 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
+      # ── Step 1: extract version from tag and patch source files ──────────────
+      # Push v0.3.0 → this sets version = "0.3.0" everywhere automatically.
+      - name: Set version from tag
+        id: version
+        run: |
+          $tag = "${{ github.ref_name }}"
+          $version = $tag.TrimStart('v')
+          echo "VERSION=$version" >> $env:GITHUB_OUTPUT
+          Write-Host "Building version: $version"
+
+          # Patch tauri.conf.json  ("version": "x.y.z")
+          (Get-Content src-tauri/tauri.conf.json -Raw) `
+            -replace '"version":\s*"[^"]+"', "`"version`": `"$version`"" |
+            Out-File -FilePath src-tauri/tauri.conf.json -Encoding utf8NoBOM
+
+          # Patch Cargo.toml — only the first 'version = "..."' line ([package])
+          $patched = $false
+          (Get-Content src-tauri/Cargo.toml | ForEach-Object {
+            if (-not $patched -and $_ -match '^version\s*=\s*"') {
+              $patched = $true
+              "version = `"$version`""
+            } else { $_ }
+          }) | Out-File -FilePath src-tauri/Cargo.toml -Encoding utf8
+
+          Write-Host "tauri.conf.json and Cargo.toml → $version"
+
+      # ── Toolchain setup ───────────────────────────────────────────────────────
       - name: Setup Node.js
         uses: actions/setup-node@v4
         with:
@@ -32,78 +59,79 @@ jobs:
       - name: Cache WiX toolset
         uses: actions/cache@v4
         with:
-          path: ${{ env.LOCALAPPDATA }}\tauri
+          path: ~\AppData\Local\tauri
           key: wix-${{ runner.os }}
 
       - name: Install frontend dependencies
         run: npm install
 
+      # ── Clear stale bundle so cached binaries can't produce wrong filenames ──
+      - name: Clear previous bundle
+        run: Remove-Item src-tauri/target/release/bundle -Recurse -Force -ErrorAction SilentlyContinue
+
+      # ── Build ─────────────────────────────────────────────────────────────────
       - name: Build Tauri app
         env:
           TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
           TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
         run: npm run tauri build
 
-      - name: Get version from tag
-        id: version
-        run: |
-          $tag = "${{ github.ref_name }}"
-          $version = $tag.TrimStart('v')
-          echo "VERSION=$version" >> $env:GITHUB_OUTPUT
-
+      # ── Inspect output ────────────────────────────────────────────────────────
       - name: List bundle output
         run: |
-          Write-Host "=== All bundle files ==="
-          Get-ChildItem src-tauri/target/release/bundle -Recurse | Select-Object FullName
-          Write-Host "=== Sig files anywhere ==="
-          Get-ChildItem src-tauri/target/release/bundle -Recurse -Filter "*.sig" | Select-Object FullName
-          Write-Host "=== Private key set? ==="
-          if ("${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}" -ne "") { Write-Host "YES" } else { Write-Host "NO - secret is empty!" }
+          Write-Host "=== Bundle files ==="
+          Get-ChildItem src-tauri/target/release/bundle -Recurse | Select-Object FullName, Length
+          Write-Host "=== Signing key present? ==="
+          if ("${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}" -ne "") { Write-Host "YES" } else { Write-Host "NO — secret is empty!" }
 
+      # ── Generate latest.json ─────────────────────────────────────────────────
       - name: Generate latest.json
         run: |
           $version = "${{ steps.version.outputs.VERSION }}"
           $bundleDir = "src-tauri/target/release/bundle/msi"
 
-          Write-Host "=== Files in bundle/msi ==="
-          Get-ChildItem "$bundleDir" -Recurse | Select-Object FullName, Length
+          # Prefer .msi.zip + .msi.zip.sig (Tauri v2 updater artifacts)
+          $artifact = Get-ChildItem "$bundleDir" -Filter "*.msi.zip" |
+                        Where-Object { $_.Name -notlike "*.sig*" } |
+                        Select-Object -First 1
+          $sig      = Get-ChildItem "$bundleDir" -Filter "*.msi.zip.sig" |
+                        Select-Object -First 1
 
-          # Tauri v2 updater artifact: .msi.zip (what the client downloads) + .msi.zip.sig
-          $zipItem = Get-ChildItem "$bundleDir" -Filter "*.msi.zip" | Where-Object { $_.Name -notlike "*.sig*" } | Select-Object -First 1
-          $sigItem = Get-ChildItem "$bundleDir" -Filter "*.msi.zip.sig" | Select-Object -First 1
-
-          # Fallback: some Tauri versions produce .msi + .msi.sig instead
-          if (-not $zipItem) {
-            Write-Host "No .msi.zip found, falling back to raw .msi"
-            $zipItem = Get-ChildItem "$bundleDir" -Filter "*.msi" | Where-Object { $_.Name -notlike "*.zip*" } | Select-Object -First 1
-            $sigItem = Get-ChildItem "$bundleDir" -Filter "*.msi.sig" | Select-Object -First 1
+          # Fallback: raw .msi + .msi.sig
+          if (-not $artifact) {
+            Write-Host "No .msi.zip found — falling back to raw .msi"
+            $artifact = Get-ChildItem "$bundleDir" -Filter "*.msi" |
+                          Where-Object { $_.Name -notlike "*.zip*" } |
+                          Select-Object -First 1
+            $sig      = Get-ChildItem "$bundleDir" -Filter "*.msi.sig" |
+                          Select-Object -First 1
           }
 
-          if (-not $zipItem) { Write-Error "No MSI artifact found in $bundleDir"; exit 1 }
-          if (-not $sigItem) { Write-Error "No matching .sig file found — is TAURI_SIGNING_PRIVATE_KEY set?"; exit 1 }
+          if (-not $artifact) { Write-Error "No MSI artifact found"; exit 1 }
+          if (-not $sig)      { Write-Error "No .sig file — is TAURI_SIGNING_PRIVATE_KEY set?"; exit 1 }
 
-          Write-Host "Artifact : $($zipItem.Name)"
-          Write-Host "Signature: $($sigItem.Name)"
+          Write-Host "Artifact : $($artifact.Name)"
+          Write-Host "Signature: $($sig.Name)"
 
-          $sig = Get-Content $sigItem.FullName -Raw
-          $url = "https://github.com/${{ github.repository }}/releases/download/${{ github.ref_name }}/$($zipItem.Name)"
+          $sigContent = (Get-Content $sig.FullName -Raw).Trim()
+          $url = "https://github.com/${{ github.repository }}/releases/download/${{ github.ref_name }}/$($artifact.Name)"
 
-          $json = [ordered]@{
-            version  = $version
-            notes    = "See the release page for what's new."
-            pub_date = (Get-Date -Format "yyyy-MM-ddTHH:mm:ssZ")
+          [ordered]@{
+            version   = $version
+            notes     = "See the release page for what's new."
+            pub_date  = (Get-Date -Format "yyyy-MM-ddTHH:mm:ssZ")
             platforms = [ordered]@{
               "windows-x86_64" = [ordered]@{
-                signature = $sig.Trim()
+                signature = $sigContent
                 url       = $url
               }
             }
-          } | ConvertTo-Json -Depth 10
+          } | ConvertTo-Json -Depth 10 |
+            Out-File -FilePath "latest.json" -Encoding utf8NoBOM
 
-          $json | Out-File -FilePath "latest.json" -Encoding utf8NoBOM
-          Write-Host "=== latest.json ==="
-          Get-Content latest.json
+          Write-Host "=== latest.json ==="; Get-Content latest.json
 
+      # ── Publish release ───────────────────────────────────────────────────────
       - name: Create GitHub Release
         uses: softprops/action-gh-release@v2
         with:
