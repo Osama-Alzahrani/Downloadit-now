@@ -114,7 +114,8 @@ jobs:
           Write-Host "Signature: $($sig.Name)"
 
           $sigContent = (Get-Content $sig.FullName -Raw).Trim()
-          $url = "https://github.com/${{ github.repository }}/releases/download/${{ github.ref_name }}/$($artifact.Name)"
+          $encodedName = $artifact.Name -replace ' ', '%20'
+          $url = "https://github.com/${{ github.repository }}/releases/download/${{ github.ref_name }}/$encodedName"
 
           [ordered]@{
             version   = $version
