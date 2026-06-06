@@ -18,7 +18,7 @@ Write-Host "Releasing $tag..." -ForegroundColor Cyan
 $confPath = "$PSScriptRoot\..\src-tauri\tauri.conf.json"
 (Get-Content $confPath -Raw) `
   -replace '"version":\s*"[^"]+"', "`"version`": `"$Version`"" |
-  Out-File -FilePath $confPath -Encoding utf8NoBOM
+  [System.IO.File]::WriteAllText($confPath, $content, [System.Text.UTF8Encoding]::new($false))
 Write-Host "  tauri.conf.json → $Version"
 
 # ── Patch Cargo.toml (first version line = [package]) ───────────────────────
