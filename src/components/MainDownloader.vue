@@ -126,6 +126,61 @@
     </div>
   </Teleport>
 
+  <!-- Live Preview Modal -->
+  <Teleport to="body">
+    <div v-if="livePreview.visible" class="fixed inset-0 z-50 flex items-center justify-center bg-gray-950/90 backdrop-blur p-4" @click.self="closeLivePreview">
+      <div class="bg-gray-900 border border-gray-700/60 rounded-xl shadow-2xl w-full max-w-2xl overflow-hidden flex flex-col">
+
+        <!-- Header -->
+        <div class="flex items-center justify-between px-4 py-3 border-b border-gray-700/50 shrink-0">
+          <div class="flex items-center gap-2 min-w-0">
+            <span class="w-2 h-2 bg-red-500 rounded-full animate-pulse shrink-0"></span>
+            <span class="text-xs font-bold text-red-400 shrink-0">LIVE PREVIEW</span>
+            <span class="text-xs text-gray-500 truncate">{{ livePreview.item?.title }}</span>
+          </div>
+          <div class="flex items-center gap-3 shrink-0 ml-3">
+            <span class="text-xs font-mono text-red-400 font-semibold">{{ livePreview.item ? elapsedFor(livePreview.item) : '' }}</span>
+            <button @click="closeLivePreview" class="text-gray-500 hover:text-gray-300 text-xl leading-none transition-colors">×</button>
+          </div>
+        </div>
+
+        <!-- Preview area — browser renders MJPEG natively via <img> -->
+        <div class="relative bg-black w-full" style="aspect-ratio: 16/9;">
+          <!-- Buffering spinner (before first frame) -->
+          <div v-if="livePreview.loading"
+            class="absolute inset-0 bg-gray-900 flex flex-col items-center justify-center gap-2 text-gray-600">
+            <div class="w-5 h-5 border-2 border-red-500 border-t-transparent rounded-full animate-spin"></div>
+            <span class="text-xs">Buffering stream…</span>
+          </div>
+          <!-- Error -->
+          <div v-if="livePreview.error"
+            class="absolute inset-0 flex flex-col items-center justify-center gap-2 text-gray-600 px-8 text-center">
+            <span class="text-3xl">🎥</span>
+            <span class="text-xs">{{ livePreview.error }}</span>
+          </div>
+          <!-- MJPEG stream — <img> handles multipart/x-mixed-replace natively -->
+          <img
+            v-if="livePreview.port"
+            :src="`http://127.0.0.1:${livePreview.port}/stream`"
+            class="w-full h-full object-contain"
+            :class="{ 'opacity-0': livePreview.loading }"
+            @load="livePreview.loading = false"
+            @error="livePreview.error = 'Stream unavailable'; livePreview.loading = false"
+          />
+        </div>
+
+        <!-- Footer -->
+        <div class="px-4 py-2.5 border-t border-gray-700/50 flex items-center justify-between shrink-0">
+          <span class="text-xs text-gray-600">Live preview · up to 15 fps</span>
+          <button @click="closeLivePreview"
+            class="px-3 py-1 bg-gray-700 hover:bg-gray-600 text-gray-300 text-xs font-semibold rounded-lg transition-colors">
+            Close
+          </button>
+        </div>
+      </div>
+    </div>
+  </Teleport>
+
   <!-- Queue -->
   <div class="flex-1 overflow-y-auto space-y-2 min-h-0">
     <!-- Empty state -->
@@ -141,7 +196,8 @@
       :key="item.id"
       class="rounded-lg overflow-hidden border transition-colors"
       :class="{
-        'bg-gray-800/60 border-teal-500/40': item.status === 'downloading',
+        'bg-gray-800/60 border-teal-500/40': item.status === 'downloading' && !item.isLive,
+        'bg-gray-800/60 border-red-500/40': item.status === 'downloading' && item.isLive,
         'bg-gray-800/60 border-yellow-500/30': item.status === 'paused',
         'bg-gray-800/40 border-emerald-500/20': item.status === 'completed',
         'bg-gray-800/40 border-red-500/20': item.status === 'error',
@@ -164,21 +220,39 @@
         <div class="flex items-start gap-3 p-3 pb-2">
           <!-- Thumbnail + downloading indicator -->
           <div class="relative shrink-0 self-center">
-            <div v-if="item.status === 'downloading'" class="absolute -left-2.5 top-1/2 -translate-y-1/2 text-teal-400 text-base font-bold">↓</div>
-            <img
-              v-if="item.thumbnail"
-              :src="item.thumbnail"
-              class="w-20 h-12 object-cover rounded"
-              @error="item.thumbnail = null"
-            />
-            <div v-else class="w-20 h-12 bg-gray-700 rounded flex items-center justify-center text-2xl">🎬</div>
+            <div v-if="item.status === 'downloading' && !item.isLive" class="absolute -left-2.5 top-1/2 -translate-y-1/2 text-teal-400 text-base font-bold">↓</div>
+            <div v-if="item.isLive" class="absolute -left-3 top-1/2 -translate-y-1/2">
+              <span v-if="item.status === 'downloading'" class="w-2.5 h-2.5 bg-red-500 rounded-full animate-pulse block"></span>
+              <span v-else class="w-2.5 h-2.5 bg-red-400/50 rounded-full block"></span>
+            </div>
+            <div
+              class="relative"
+              :class="item.isLive && item.status === 'downloading' ? 'cursor-pointer group/thumb' : ''"
+              @click.stop="item.isLive && item.status === 'downloading' && watchLive(item)"
+            >
+              <img
+                v-if="item.thumbnail"
+                :src="item.thumbnail"
+                class="w-20 h-12 object-cover rounded"
+                @error="item.thumbnail = null"
+              />
+              <div v-else class="w-20 h-12 bg-gray-700 rounded flex items-center justify-center text-2xl">🎬</div>
+              <!-- Watch live overlay — visible on hover during recording -->
+              <div
+                v-if="item.isLive && item.status === 'downloading'"
+                class="absolute inset-0 bg-black/60 rounded flex flex-col items-center justify-center gap-0.5 opacity-0 group-hover/thumb:opacity-100 transition-opacity duration-150"
+              >
+                <span class="text-white text-sm leading-none">▶</span>
+                <span class="text-white text-[8px] font-bold tracking-wide leading-none">WATCH</span>
+              </div>
+            </div>
           </div>
 
           <!-- Content -->
           <div class="flex-1 min-w-0">
             <div class="flex items-start justify-between gap-1 mb-1.5">
               <p class="text-sm font-semibold text-gray-100 leading-tight line-clamp-2">{{ item.title }}</p>
-              <button @click="removeItem(item.id)" class="shrink-0 text-gray-600 hover:text-gray-300 text-xl leading-none ml-1 transition-colors">×</button>
+              <button v-if="item.status !== 'downloading'" @click="removeItem(item.id)" class="shrink-0 text-gray-600 hover:text-gray-300 text-xl leading-none ml-1 transition-colors">×</button>
             </div>
 
             <!-- Metadata badges -->
@@ -187,7 +261,8 @@
               <span v-if="item.width && item.height" class="px-1.5 py-0.5 bg-gray-700/80 text-gray-300 text-xs rounded font-mono">{{ item.width }}×{{ item.height }}</span>
               <span v-if="item.duration" class="px-1.5 py-0.5 bg-gray-700/80 text-gray-300 text-xs rounded font-mono">{{ formatDuration(item.duration) }}</span>
               <span v-if="item.filesize" class="px-1.5 py-0.5 bg-gray-700/80 text-gray-300 text-xs rounded font-mono">{{ formatFilesize(item.filesize) }}</span>
-              <span v-if="item.selectedFormatLabel" class="px-1.5 py-0.5 bg-teal-500/20 border border-teal-500/40 text-teal-300 text-xs rounded">{{ item.selectedFormatLabel }}</span>
+              <span v-if="item.selectedFormatLabel && !item.isLive" class="px-1.5 py-0.5 bg-teal-500/20 border border-teal-500/40 text-teal-300 text-xs rounded">{{ item.selectedFormatLabel }}</span>
+              <span v-if="item.isLive" class="px-1.5 py-0.5 bg-red-500/20 border border-red-500/40 text-red-300 text-xs rounded font-semibold">● LIVE</span>
             </div>
 
             <!-- Status -->
@@ -214,9 +289,9 @@
 
           <!-- Right buttons -->
           <div class="shrink-0 flex flex-col gap-1 self-start">
-            <!-- Show/hide formats toggle (only when ready or has format selected) -->
+            <!-- Show/hide formats toggle (not for live streams) -->
             <button
-              v-if="item.status === 'ready'"
+              v-if="item.status === 'ready' && !item.isLive"
               @click="toggleFormats(item)"
               :class="[
                 'px-2.5 py-1 text-xs font-semibold rounded transition-colors whitespace-nowrap',
@@ -227,24 +302,32 @@
             >
               {{ item.showFormats ? '✕ Formats' : '📊 Formats' }}
             </button>
-            <!-- Start with best quality -->
+            <!-- Start with best quality (not for live) -->
             <button
-              v-if="item.status === 'ready'"
+              v-if="item.status === 'ready' && !item.isLive"
               @click="startBest(item.id)"
               class="px-2.5 py-1 bg-teal-500/20 hover:bg-teal-500/30 border border-teal-500/40 text-teal-300 text-xs font-semibold rounded transition-colors whitespace-nowrap"
             >
               ↓ Best
             </button>
-            <!-- Audio only -->
+            <!-- Audio only (not for live) -->
             <button
-              v-if="item.status === 'ready'"
+              v-if="item.status === 'ready' && !item.isLive"
               @click="startAudio(item.id)"
               class="px-2.5 py-1 bg-purple-500/20 hover:bg-purple-500/30 border border-purple-500/40 text-purple-300 text-xs font-semibold rounded transition-colors whitespace-nowrap"
             >
               ♪ MP3
             </button>
-            <!-- Downloading: Pause + Cancel -->
-            <template v-if="item.status === 'downloading'">
+            <!-- Record (live streams only) -->
+            <button
+              v-if="item.status === 'ready' && item.isLive"
+              @click="startRecord(item.id)"
+              class="px-2.5 py-1 bg-red-500/20 hover:bg-red-500/30 border border-red-500/40 text-red-300 text-xs font-semibold rounded transition-colors whitespace-nowrap"
+            >
+              ⏺ Record
+            </button>
+            <!-- Downloading: Pause + Cancel (not for live) -->
+            <template v-if="item.status === 'downloading' && !item.isLive">
               <button @click="pauseItem(item.id)" class="px-2.5 py-1 bg-yellow-500/20 hover:bg-yellow-500/30 border border-yellow-500/40 text-yellow-300 text-xs font-semibold rounded transition-colors whitespace-nowrap">
                 ⏸ Pause
               </button>
@@ -252,6 +335,14 @@
                 ✕ Cancel
               </button>
             </template>
+            <!-- Stop recording (live only) -->
+            <button
+              v-else-if="item.status === 'downloading' && item.isLive"
+              @click="stopRecording(item.id)"
+              class="px-2.5 py-1 bg-red-500/20 hover:bg-red-500/30 border border-red-500/40 text-red-300 text-xs font-semibold rounded transition-colors whitespace-nowrap"
+            >
+              ⏹ Stop
+            </button>
             <!-- Paused: Resume + Cancel -->
             <template v-else-if="item.status === 'paused'">
               <button @click="resumeItem(item.id)" class="px-2.5 py-1 bg-teal-500/20 hover:bg-teal-500/30 border border-teal-500/40 text-teal-300 text-xs font-semibold rounded transition-colors whitespace-nowrap">
@@ -274,17 +365,33 @@
 
         <!-- Progress bar -->
         <div v-if="item.status === 'downloading' || item.status === 'paused'" class="px-3 pb-2.5">
-          <div class="w-full bg-gray-700/60 rounded-full h-1.5 overflow-hidden mb-1">
-            <div
-              class="h-full rounded-full transition-all duration-300"
-              :class="item.status === 'paused' ? 'bg-gray-500' : 'bg-linear-to-r from-teal-500 to-cyan-400'"
-              :style="{ width: `${item.progress}%` }"
-            ></div>
-          </div>
-          <div class="flex justify-between text-xs text-gray-500">
-            <span class="truncate pr-2">{{ item.statusText }}</span>
-            <span class="shrink-0">{{ Math.round(item.progress) }}%</span>
-          </div>
+          <!-- Live recording bar -->
+          <template v-if="item.isLive && item.status === 'downloading'">
+            <div class="w-full bg-gray-700/60 rounded-full h-1.5 overflow-hidden mb-1">
+              <div class="h-full w-full bg-red-500/70 rounded-full animate-pulse"></div>
+            </div>
+            <div class="flex justify-between text-xs text-gray-500">
+              <span class="truncate pr-2 flex items-center gap-1.5">
+                <span class="w-1.5 h-1.5 bg-red-500 rounded-full animate-pulse shrink-0"></span>
+                {{ item.statusText || 'Recording…' }}
+              </span>
+              <span class="shrink-0 text-red-400 font-mono font-semibold">{{ elapsedFor(item) }}</span>
+            </div>
+          </template>
+          <!-- Regular download bar -->
+          <template v-else>
+            <div class="w-full bg-gray-700/60 rounded-full h-1.5 overflow-hidden mb-1">
+              <div
+                class="h-full rounded-full transition-all duration-300"
+                :class="item.status === 'paused' ? 'bg-gray-500' : 'bg-linear-to-r from-teal-500 to-cyan-400'"
+                :style="{ width: `${item.progress}%` }"
+              ></div>
+            </div>
+            <div class="flex justify-between text-xs text-gray-500">
+              <span class="truncate pr-2">{{ item.statusText }}</span>
+              <span class="shrink-0">{{ Math.round(item.progress) }}%</span>
+            </div>
+          </template>
         </div>
 
         <!-- Format table (inline, expandable) -->
@@ -355,7 +462,7 @@
 import { ref, reactive, onMounted, watch } from 'vue'
 import { invoke } from '@tauri-apps/api/core'
 import { listen } from '@tauri-apps/api/event'
-import { open } from '@tauri-apps/plugin-dialog'
+import { open as pickFolder } from '@tauri-apps/plugin-dialog'
 
 const emit = defineEmits(['history-update'])
 
@@ -363,6 +470,32 @@ const url = ref('')
 const downloadPath = ref(null)
 const queue = ref([])
 let idCounter = 0
+
+// Live recording elapsed timer
+const now = ref(Date.now())
+let recordingTimer = null
+
+const startRecordingTimer = () => {
+  if (!recordingTimer) {
+    recordingTimer = setInterval(() => { now.value = Date.now() }, 1000)
+  }
+}
+
+const stopRecordingTimerIfDone = () => {
+  if (!queue.value.some(i => i.isLive && i.status === 'downloading')) {
+    if (recordingTimer) { clearInterval(recordingTimer); recordingTimer = null }
+  }
+}
+
+const elapsedFor = (item) => {
+  if (!item.recordingStartedAt) return '00:00'
+  const secs = Math.max(0, Math.floor((now.value - item.recordingStartedAt) / 1000))
+  const h = Math.floor(secs / 3600)
+  const m = Math.floor((secs % 3600) / 60)
+  const s = secs % 60
+  const pad = n => String(n).padStart(2, '0')
+  return h > 0 ? `${pad(h)}:${pad(m)}:${pad(s)}` : `${pad(m)}:${pad(s)}`
+}
 
 // Playlist picker state
 const playlist = reactive({
@@ -410,6 +543,8 @@ const addFromPlaylist = (entry) => {
     selectedFormat: null,
     selectedFormatLabel: null,
     audioOnly: false,
+    isLive: false,
+    recordingStartedAt: null,
     progress: 0,
     status: 'ready',
     statusText: '',
@@ -448,6 +583,7 @@ watch(queue, (q) => {
     height: item.height,
     selectedFormat: item.selectedFormat,
     selectedFormatLabel: item.selectedFormatLabel,
+    isLive: item.isLive,
     progress: item.progress,
     status: item.status,
     statusText: item.statusText,
@@ -541,6 +677,8 @@ const addToQueue = async () => {
     height: null,
     selectedFormat: null,
     selectedFormatLabel: null,
+    isLive: false,
+    recordingStartedAt: null,
     progress: 0,
     status: 'fetching',
     statusText: '',
@@ -563,6 +701,7 @@ const addToQueue = async () => {
       item.ext = info.ext || null
       item.width = info.width || null
       item.height = info.height || null
+      item.isLive = info.is_live || false
       item.status = 'ready'
     }
   } catch (err) {
@@ -676,6 +815,35 @@ const startAudio = (itemId) => {
   enqueueItem(itemId)
 }
 
+const startRecord = (itemId) => {
+  const item = queue.value.find(i => i.id === itemId)
+  if (!item || item.status !== 'ready') return
+  item.selectedFormat = null
+  item.selectedFormatLabel = 'Live Recording'
+  item.audioOnly = false
+  item.showFormats = false
+  enqueueItem(itemId)
+}
+
+const stopRecording = async (id) => {
+  const item = queue.value.find(i => i.id === id)
+  if (!item || !item.isLive || item.status !== 'downloading') return
+  if (livePreview.downloadId === id) await closeLivePreview()
+  // Set completed immediately so any incoming download-error event is ignored
+  item.status = 'completed'
+  item.progress = 100
+  item.statusText = ''
+  try {
+    const filePath = await invoke('stop_recording', { downloadId: id })
+    item.filePath = filePath || null
+    saveToHistory(item, filePath)
+  } catch {
+    saveToHistory(item, null)
+  }
+  stopRecordingTimerIfDone()
+  startNextIfIdle()
+}
+
 const enqueueItem = (itemId) => {
   const item = queue.value.find(i => i.id === itemId)
   if (!item || item.status !== 'ready') return
@@ -699,6 +867,11 @@ const startDownload = async (item) => {
   item.progress = 0
   item.statusText = ''
   item.error = null
+
+  if (item.isLive) {
+    item.recordingStartedAt = Date.now()
+    startRecordingTimer()
+  }
 
   try {
     await invoke('download_video_stream', {
@@ -765,7 +938,7 @@ const removeItem = (id) => cancelItem(id)
 
 const pickDownloadPath = async () => {
   try {
-    const selected = await open({ directory: true, multiple: false })
+    const selected = await pickFolder({ directory: true, multiple: false })
     if (selected) {
       downloadPath.value = selected
       localStorage.setItem('downloadPath', selected)
@@ -815,6 +988,45 @@ const clearCompleted = () => {
   queue.value = queue.value.filter(i => i.status !== 'completed' && i.status !== 'error')
 }
 
+// Live preview modal — local MJPEG HTTP server, browser renders natively
+const livePreview = reactive({
+  visible: false,
+  downloadId: null,
+  item: null,
+  port: null,
+  loading: true,
+  error: null,
+})
+
+const watchLive = async (item) => {
+  await closeLivePreview()
+  livePreview.visible = true
+  livePreview.downloadId = item.id
+  livePreview.item = item
+  livePreview.port = null
+  livePreview.loading = true
+  livePreview.error = null
+  try {
+    livePreview.port = await invoke('start_live_preview', { downloadId: item.id })
+  } catch (e) {
+    livePreview.error = String(e)
+    livePreview.loading = false
+  }
+}
+
+const closeLivePreview = async () => {
+  if (!livePreview.visible && !livePreview.downloadId) return
+  const id = livePreview.downloadId
+  livePreview.visible = false
+  livePreview.downloadId = null
+  livePreview.port = null
+  livePreview.loading = true
+  livePreview.error = null
+  if (id) {
+    try { await invoke('stop_live_preview', { downloadId: id }) } catch {}
+  }
+}
+
 const openFile = async (filePath) => {
   if (!filePath) return
   try {
@@ -849,6 +1061,8 @@ onMounted(async () => {
         loadingFormats: false,
         formatTable: [],
         formatsError: null,
+        recordingStartedAt: null,
+        isLive: item.isLive || false,
         // Downloads that were active when app closed become paused (resumable)
         status: item.status === 'downloading' || item.status === 'fetching'
           ? 'paused'
@@ -892,18 +1106,20 @@ onMounted(async () => {
       item.filePath = file_path || null
       saveToHistory(item, file_path)
     }
+    stopRecordingTimerIfDone()
     startNextIfIdle()
   })
 
   await listen('download-error', (event) => {
     const { download_id, message } = event.payload
     const item = queue.value.find(i => i.id === download_id)
-    // If item is paused, ignore — pauseItem already set the state
-    if (!item || item.status === 'paused') return
+    // Ignore if already handled (paused, or live recording stopped)
+    if (!item || item.status === 'paused' || item.status === 'completed') return
     const msg = String(message || '')
     if (!msg.includes('paused') && !msg.includes('cancelled')) {
       item.status = 'error'
       item.error = msg
+      stopRecordingTimerIfDone()
       startNextIfIdle()
     }
   })

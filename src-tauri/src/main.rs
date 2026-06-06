@@ -1,7 +1,7 @@
 // Prevents additional console window on Windows in release, DO NOT REMOVE!!
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
-use downloadit_lib::{download_video as download_video_impl, download_video_with_window, get_video_formats_with_window, pause_download as pause_download_impl, cancel_download as cancel_download_impl, get_video_info as get_video_info_impl, get_playlist_info as get_playlist_info_impl, open_file as open_file_impl, reveal_in_folder as reveal_in_folder_impl, check_dependencies as check_deps_impl, download_dependencies as download_deps_impl, DepsStatus, VideoInfo, PlaylistEntry};
+use downloadit_lib::{download_video as download_video_impl, download_video_with_window, get_video_formats_with_window, pause_download as pause_download_impl, cancel_download as cancel_download_impl, stop_recording as stop_recording_impl, capture_frame as capture_frame_impl, start_live_preview as start_live_preview_impl, stop_live_preview as stop_live_preview_impl, get_video_info as get_video_info_impl, get_playlist_info as get_playlist_info_impl, open_file as open_file_impl, reveal_in_folder as reveal_in_folder_impl, check_dependencies as check_deps_impl, download_dependencies as download_deps_impl, DepsStatus, VideoInfo, PlaylistEntry};
 use serde::{Deserialize, Serialize};
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -55,6 +55,26 @@ async fn cancel_download(download_id: String) -> Result<String, String> {
 }
 
 #[tauri::command]
+async fn stop_recording(download_id: String) -> Result<Option<String>, String> {
+    stop_recording_impl(download_id).await
+}
+
+#[tauri::command]
+async fn capture_frame(download_id: String) -> Result<String, String> {
+    capture_frame_impl(download_id).await
+}
+
+#[tauri::command]
+async fn start_live_preview(download_id: String) -> Result<u16, String> {
+    start_live_preview_impl(download_id).await
+}
+
+#[tauri::command]
+async fn stop_live_preview(download_id: String) -> Result<(), String> {
+    stop_live_preview_impl(download_id).await
+}
+
+#[tauri::command]
 async fn open_file(path: String) -> Result<(), String> {
     open_file_impl(path).await
 }
@@ -80,7 +100,7 @@ fn main() {
         .plugin(tauri_plugin_process::init())
         .plugin(tauri_plugin_opener::init())
         .plugin(tauri_plugin_dialog::init())
-        .invoke_handler(tauri::generate_handler![download_video, download_video_stream, get_video_formats, pause_download, cancel_download, get_video_info, get_playlist_info, open_file, reveal_in_folder, check_dependencies, download_dependencies])
+        .invoke_handler(tauri::generate_handler![download_video, download_video_stream, get_video_formats, pause_download, cancel_download, stop_recording, capture_frame, start_live_preview, stop_live_preview, get_video_info, get_playlist_info, open_file, reveal_in_folder, check_dependencies, download_dependencies])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
 }
