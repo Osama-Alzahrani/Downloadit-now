@@ -261,7 +261,7 @@
               <span v-if="item.width && item.height" class="px-1.5 py-0.5 bg-gray-700/80 text-gray-300 text-xs rounded font-mono">{{ item.width }}×{{ item.height }}</span>
               <span v-if="item.duration" class="px-1.5 py-0.5 bg-gray-700/80 text-gray-300 text-xs rounded font-mono">{{ formatDuration(item.duration) }}</span>
               <span v-if="item.filesize" class="px-1.5 py-0.5 bg-gray-700/80 text-gray-300 text-xs rounded font-mono">{{ formatFilesize(item.filesize) }}</span>
-              <span v-if="item.selectedFormatLabel && !item.isLive" class="px-1.5 py-0.5 bg-teal-500/20 border border-teal-500/40 text-teal-300 text-xs rounded">{{ item.selectedFormatLabel }}</span>
+              <span v-if="item.selectedFormatLabel" class="px-1.5 py-0.5 bg-teal-500/20 border border-teal-500/40 text-teal-300 text-xs rounded">{{ item.selectedFormatLabel }}</span>
               <span v-if="item.isLive" class="px-1.5 py-0.5 bg-red-500/20 border border-red-500/40 text-red-300 text-xs rounded font-semibold">● LIVE</span>
             </div>
 
@@ -289,9 +289,9 @@
 
           <!-- Right buttons -->
           <div class="shrink-0 flex flex-col gap-1 self-start">
-            <!-- Show/hide formats toggle (not for live streams) -->
+            <!-- Show/hide formats toggle -->
             <button
-              v-if="item.status === 'ready' && !item.isLive"
+              v-if="item.status === 'ready'"
               @click="toggleFormats(item)"
               :class="[
                 'px-2.5 py-1 text-xs font-semibold rounded transition-colors whitespace-nowrap',
@@ -324,7 +324,7 @@
               @click="startRecord(item.id)"
               class="px-2.5 py-1 bg-red-500/20 hover:bg-red-500/30 border border-red-500/40 text-red-300 text-xs font-semibold rounded transition-colors whitespace-nowrap"
             >
-              ⏺ Record
+              ⏺ {{ item.selectedFormat ? 'Record' : 'Record Best' }}
             </button>
             <!-- Downloading: Pause + Cancel (not for live) -->
             <template v-if="item.status === 'downloading' && !item.isLive">
@@ -793,6 +793,10 @@ const downloadWithFormat = (itemId, formatId, fmt) => {
   item.selectedFormat = effectiveFormat
   item.selectedFormatLabel = `${fmt.ext?.toUpperCase()} ${resLabel} (${formatId})${fmt.videoOnly ? ' +audio' : ''}`
   item.showFormats = false
+
+  // For live streams: just select the format, user still clicks Record to start
+  if (item.isLive) return
+
   enqueueItem(itemId)
 }
 
@@ -818,8 +822,8 @@ const startAudio = (itemId) => {
 const startRecord = (itemId) => {
   const item = queue.value.find(i => i.id === itemId)
   if (!item || item.status !== 'ready') return
-  item.selectedFormat = null
-  item.selectedFormatLabel = 'Live Recording'
+  // Preserve selectedFormat if user picked one via format table
+  if (!item.selectedFormat) item.selectedFormatLabel = 'Live Recording'
   item.audioOnly = false
   item.showFormats = false
   enqueueItem(itemId)
