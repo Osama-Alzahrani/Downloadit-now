@@ -5,6 +5,8 @@ use std::process::Stdio;
 use std::io::Write;
 use tokio::sync::Mutex;
 use tokio::io::AsyncBufReadExt;
+use tokio::io::AsyncReadExt;
+use tokio::io::AsyncWriteExt;
 use tokio::io::BufReader;
 use tokio::process::Command;
 use tauri::Emitter;
@@ -27,6 +29,7 @@ pub struct VideoInfo {
     pub ext: Option<String>,
     pub width: Option<u64>,
     pub height: Option<u64>,
+    pub is_live: Option<bool>,
 }
 
 // Per-download state entry
@@ -39,6 +42,9 @@ struct DownloadEntry {
 // Global registry: download_id -> DownloadEntry
 lazy_static::lazy_static! {
     static ref DOWNLOADS: Mutex<std::collections::HashMap<String, DownloadEntry>> =
+        Mutex::new(std::collections::HashMap::new());
+    // Live preview registry: download_id -> current ffmpeg preview PID
+    static ref PREVIEWS: Mutex<std::collections::HashMap<String, u32>> =
         Mutex::new(std::collections::HashMap::new());
 }
 
@@ -254,6 +260,293 @@ pub async fn cancel_download(download_id: String) -> Result<String, String> {
     } else {
         Ok("Download cancelled (already stopped)".to_string())
     }
+}
+
+/// Minimal Base64 encoder — avoids adding a crate dependency.
+fn encode_base64(data: &[u8]) -> String {
+    const T: &[u8] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    let mut out = String::with_capacity((data.len() + 2) / 3 * 4);
+    for chunk in data.chunks(3) {
+        let b0 = chunk[0] as u32;
+        let b1 = chunk.get(1).copied().unwrap_or(0) as u32;
+        let b2 = chunk.get(2).copied().unwrap_or(0) as u32;
+        let n = (b0 << 16) | (b1 << 8) | b2;
+        out.push(T[(n >> 18 & 63) as usize] as char);
+        out.push(T[(n >> 12 & 63) as usize] as char);
+        out.push(if chunk.len() > 1 { T[(n >> 6 & 63) as usize] as char } else { '=' });
+        out.push(if chunk.len() > 2 { T[(n & 63) as usize] as char } else { '=' });
+    }
+    out
+}
+
+/// Returns the path to the managed ffmpeg binary, falling back to PATH.
+fn get_ffmpeg_command() -> String {
+    #[cfg(target_os = "windows")]
+    let exe = get_tools_dir().join("ffmpeg.exe");
+    #[cfg(not(target_os = "windows"))]
+    let exe = get_tools_dir().join("ffmpeg");
+    if exe.exists() { exe.to_string_lossy().to_string() } else { "ffmpeg".to_string() }
+}
+
+// ─── Live preview — local MJPEG HTTP server ──────────────────────────────────
+//
+// Binds a TCP listener on a random port, accepts one browser connection, and
+// serves MJPEG via a persistent ffmpeg process.  The frontend just sets:
+//   <img :src="`http://127.0.0.1:${port}/stream`">
+// The browser renders MJPEG natively — no IPC per frame, no base64, ~15 fps.
+
+async fn serve_mjpeg(
+    stream: tokio::net::TcpStream,
+    ffmpeg: String,
+    path: PathBuf,
+    download_id: String,
+) {
+    let (mut rx, mut tx) = stream.into_split();
+
+    // Drain the HTTP request (content doesn't matter)
+    let mut req = [0u8; 2048];
+    let _ = rx.read(&mut req).await;
+
+    // Boundary "ffmpeg" matches mpjpeg muxer default
+    let hdr = b"HTTP/1.1 200 OK\r\n\
+                Content-Type: multipart/x-mixed-replace;boundary=ffmpeg\r\n\
+                Cache-Control: no-cache\r\n\
+                Access-Control-Allow-Origin: *\r\n\
+                Connection: keep-alive\r\n\r\n";
+    if tx.write_all(hdr).await.is_err() { return; }
+
+    let mut buf = vec![0u8; 65_536];
+
+    loop {
+        if !PREVIEWS.lock().await.contains_key(&download_id) { break; }
+
+        let mut cmd = Command::new(&ffmpeg);
+        cmd.args(&["-y", "-sseof", "-60", "-re", "-i"]).arg(&path)
+           .args(&["-an", "-vf", "fps=15,scale=640:-1", "-f", "mpjpeg", "pipe:1"])
+           .stdout(Stdio::piped()).stderr(Stdio::null());
+        #[cfg(target_os = "windows")]
+        cmd.creation_flags(0x08000000);
+
+        let mut child = match cmd.spawn() {
+            Ok(c) => c,
+            Err(_) => { tokio::time::sleep(std::time::Duration::from_secs(2)).await; continue; }
+        };
+
+        if let Some(pid) = child.id() {
+            PREVIEWS.lock().await.insert(download_id.clone(), pid);
+        }
+
+        let mut client_gone = false;
+        if let Some(mut ffout) = child.stdout.take() {
+            loop {
+                match ffout.read(&mut buf).await {
+                    Ok(0) | Err(_) => break,
+                    Ok(n) => if tx.write_all(&buf[..n]).await.is_err() {
+                        client_gone = true;
+                        break;
+                    },
+                }
+            }
+        }
+        let _ = child.wait().await;
+        if client_gone { break; }
+        if !PREVIEWS.lock().await.contains_key(&download_id) { break; }
+        tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+    }
+}
+
+pub async fn start_live_preview(download_id: String) -> Result<u16, String> {
+    stop_live_preview(download_id.clone()).await?;
+
+    let dir_and_snapshot = {
+        let downloads = DOWNLOADS.lock().await;
+        downloads.get(&download_id).map(|e| (e.dir.clone(), e.snapshot.clone()))
+    };
+    let Some((dir, snapshot)) = dir_and_snapshot else {
+        return Err("No active recording".to_string());
+    };
+
+    let rec_path = std::fs::read_dir(&dir).ok()
+        .and_then(|entries| {
+            entries.flatten()
+                .map(|ent| ent.path())
+                .filter(|p| !snapshot.contains(p))
+                .max_by_key(|p| p.metadata().and_then(|m| m.modified()).ok())
+        })
+        .ok_or_else(|| "Recording file not found".to_string())?;
+
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await.map_err(|e| e.to_string())?;
+    let port = listener.local_addr().map_err(|e| e.to_string())?.port();
+
+    // u32::MAX = server running but no ffmpeg PID yet (prevent accidental kill)
+    PREVIEWS.lock().await.insert(download_id.clone(), u32::MAX);
+
+    let id = download_id.clone();
+    let ffmpeg = get_ffmpeg_command();
+    tokio::spawn(async move {
+        if let Ok((stream, _)) = listener.accept().await {
+            if PREVIEWS.lock().await.contains_key(&id) {
+                serve_mjpeg(stream, ffmpeg, rec_path, id).await;
+            }
+        }
+    });
+
+    Ok(port)
+}
+
+pub async fn stop_live_preview(download_id: String) -> Result<(), String> {
+    let pid = PREVIEWS.lock().await.remove(&download_id);
+    if let Some(p) = pid { if p != u32::MAX { kill_pid(p); } }
+    Ok(())
+}
+
+/// Stop a live stream recording:
+///   1. Kill yt-dlp (file stays as .part or incomplete container)
+///   2. Remux with `ffmpeg -c copy` to fix container headers and strip corrupt tail
+///   3. If remux fails, at least rename .part → final extension
+/// Returns the path of the usable recorded file.
+pub async fn stop_recording(download_id: String) -> Result<Option<String>, String> {
+    println_flush!("⏹ stop_recording [{}]", download_id);
+    let entry = DOWNLOADS.lock().await.remove(&download_id);
+    let Some(e) = entry else { return Ok(None); };
+
+    kill_pid(e.pid);
+    // Give yt-dlp time to flush its last write
+    tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+
+    // Find the newest file created since recording started (includes .part files)
+    let raw_path = match std::fs::read_dir(&e.dir)
+        .ok()
+        .and_then(|entries| {
+            entries.flatten()
+                .map(|ent| ent.path())
+                .filter(|p| !e.snapshot.contains(p))
+                .max_by_key(|p| p.metadata().and_then(|m| m.modified()).ok())
+        }) {
+        Some(p) => p,
+        None => {
+            println_flush!("⏹ No recorded file found");
+            return Ok(None);
+        }
+    };
+
+    println_flush!("⏹ Raw file: {}", raw_path.display());
+
+    let is_part = raw_path.to_string_lossy().ends_with(".part");
+
+    // Determine the output path:
+    //   .part file  → strip .part  (e.g. video.mp4.part → video.mp4)
+    //   other file  → _rec_ prefix (avoid reading and writing the same file)
+    let final_path = if is_part {
+        raw_path.with_extension("") // removes .part, keeps inner extension
+    } else {
+        let name = raw_path.file_name().unwrap_or_default().to_string_lossy();
+        raw_path.with_file_name(format!("_rec_{}", name))
+    };
+
+    // Remux via ffmpeg -c copy to repair container headers and drop corrupt tail
+    let ffmpeg = get_ffmpeg_command();
+    let mut cmd = Command::new(&ffmpeg);
+    cmd.arg("-y")
+       .arg("-i").arg(&raw_path)
+       .arg("-c").arg("copy")
+       .arg(&final_path);
+    #[cfg(target_os = "windows")]
+    cmd.creation_flags(0x08000000); // CREATE_NO_WINDOW
+
+    match cmd.status().await {
+        Ok(s) if s.success() => {
+            println_flush!("✅ Remux OK → {}", final_path.display());
+            let _ = std::fs::remove_file(&raw_path);
+            if !is_part {
+                // Replace original with remuxed version
+                let _ = std::fs::rename(&final_path, &raw_path);
+                return Ok(Some(raw_path.to_string_lossy().to_string()));
+            }
+            return Ok(Some(final_path.to_string_lossy().to_string()));
+        }
+        err => {
+            println_flush!("⚠️ ffmpeg remux failed ({:?}), falling back", err);
+            let _ = std::fs::remove_file(&final_path);
+        }
+    }
+
+    // Fallback: rename .part → final extension (no container fix, but at least openable)
+    if is_part {
+        let renamed = raw_path.with_extension("");
+        if std::fs::rename(&raw_path, &renamed).is_ok() {
+            println_flush!("↪ Renamed: {}", renamed.display());
+            return Ok(Some(renamed.to_string_lossy().to_string()));
+        }
+    }
+
+    Ok(Some(raw_path.to_string_lossy().to_string()))
+}
+
+/// Grab the latest decodable video frame from an in-progress recording.
+/// Returns a JPEG as a base64 data URL so the frontend can display it directly.
+pub async fn capture_frame(download_id: String) -> Result<String, String> {
+    // Snapshot dir/snapshot while holding the lock only briefly
+    let dir_and_snapshot = {
+        let downloads = DOWNLOADS.lock().await;
+        downloads.get(&download_id).map(|e| (e.dir.clone(), e.snapshot.clone()))
+    };
+    let Some((dir, snapshot)) = dir_and_snapshot else {
+        return Err("No active recording".to_string());
+    };
+
+    // Find the newest file created since the recording started
+    let rec_path = std::fs::read_dir(&dir)
+        .ok()
+        .and_then(|entries| {
+            entries.flatten()
+                .map(|ent| ent.path())
+                .filter(|p| !snapshot.contains(p))
+                .max_by_key(|p| p.metadata().and_then(|m| m.modified()).ok())
+        })
+        .ok_or_else(|| "Recording file not found".to_string())?;
+
+    let preview_path = std::env::temp_dir()
+        .join(format!("dnit_preview_{}.jpg", download_id));
+    let ffmpeg = get_ffmpeg_command();
+
+    // First try: seek to 10 s before the current end of file ("latest" frame)
+    let captured = {
+        let mut cmd = Command::new(&ffmpeg);
+        cmd.args(&["-y", "-sseof", "-10"])
+           .arg("-i").arg(&rec_path)
+           .args(&["-an", "-vframes", "1", "-vf", "scale=640:-1"])
+           .arg(&preview_path)
+           .stdout(Stdio::null())
+           .stderr(Stdio::null());
+        #[cfg(target_os = "windows")]
+        cmd.creation_flags(0x08000000);
+        matches!(cmd.status().await, Ok(s) if s.success())
+            && preview_path.metadata().map(|m| m.len() > 0).unwrap_or(false)
+    };
+
+    // Fallback: grab the first decodable frame (no seek)
+    if !captured {
+        let mut cmd = Command::new(&ffmpeg);
+        cmd.args(&["-y"])
+           .arg("-i").arg(&rec_path)
+           .args(&["-an", "-vframes", "1", "-vf", "scale=640:-1"])
+           .arg(&preview_path)
+           .stdout(Stdio::null())
+           .stderr(Stdio::null());
+        #[cfg(target_os = "windows")]
+        cmd.creation_flags(0x08000000);
+        let _ = cmd.status().await;
+    }
+
+    let jpeg = std::fs::read(&preview_path)
+        .map_err(|_| "Frame capture failed — recording may still be starting".to_string())?;
+    let _ = std::fs::remove_file(&preview_path);
+    if jpeg.is_empty() {
+        return Err("Empty frame — try again in a moment".to_string());
+    }
+    Ok(format!("data:image/jpeg;base64,{}", encode_base64(&jpeg)))
 }
 
 /// Cross-platform resolution of the user's Desktop directory
@@ -1114,5 +1407,6 @@ pub async fn get_video_info(url: String) -> Result<VideoInfo, String> {
         ext: json["ext"].as_str().map(|s| s.to_string()),
         width: json["width"].as_u64(),
         height: json["height"].as_u64(),
+        is_live: json["is_live"].as_bool(),
     })
 }

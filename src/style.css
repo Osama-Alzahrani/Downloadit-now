@@ -1,5 +1,24 @@
 @import "tailwindcss";
 
+/* Custom scrollbar */
+::-webkit-scrollbar {
+  width: 6px;
+  height: 6px;
+}
+::-webkit-scrollbar-track {
+  background: transparent;
+}
+::-webkit-scrollbar-thumb {
+  background: rgba(45, 212, 191, 0.25);
+  border-radius: 999px;
+}
+::-webkit-scrollbar-thumb:hover {
+  background: rgba(45, 212, 191, 0.5);
+}
+::-webkit-scrollbar-corner {
+  background: transparent;
+}
+
 @keyframes spin {
   to {
     transform: rotate(360deg);
